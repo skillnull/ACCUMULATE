@@ -57,4 +57,5 @@ disable-model-invocation: false
 
 ## 本地扩展
 
-- 本机知识库路径及私有业务约定仅保存到已忽略的 `SKILL.local.md`；存在时与主规则一并读取。
+- 若同目录存在 `SKILL.local.md`，必须一并读取并遵守；该文件仅保存本机配置，不纳入版本控制。
+
