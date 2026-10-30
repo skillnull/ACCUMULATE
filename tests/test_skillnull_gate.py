@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -156,6 +157,42 @@ class SkillnullGateTest(unittest.TestCase):
 			"SKILLNULL — 编写与迭代守则",
 			output["hookSpecificOutput"]["additionalContext"],
 		)
+
+	def test_relocated_hook_loads_adjacent_rules_through_symlink(self) -> None:
+		relocated_script = self.write_source(
+			"relocated/scripts/skillnull_gate.py",
+			SCRIPT_PATH.read_text(encoding="utf-8"),
+		)
+		self.write_source("relocated/SKILL.md", "portable main rules\n")
+		local_rules = self.write_source(
+			"relocated/SKILL.local.md", "portable local rules\n"
+		)
+		linked_directory = self.repo_root / "linked-skill"
+		linked_directory.symlink_to(relocated_script.parent.parent, target_is_directory=True)
+		payload = json.dumps(
+			{
+				"hook_event_name": "UserPromptSubmit",
+				"session_id": "relocated-test-session",
+				"cwd": str(self.repo_root),
+				"prompt": "检查规则加载",
+			}
+		)
+		for include_local in (True, False):
+			with self.subTest(include_local=include_local):
+				if not include_local:
+					local_rules.unlink()
+				result = subprocess.run(
+					[sys.executable, str(linked_directory / "scripts/skillnull_gate.py")],
+					input=payload,
+					cwd=self.repo_root / "src",
+					capture_output=True,
+					text=True,
+					check=True,
+				)
+				context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+				self.assertIn("portable main rules", context)
+				self.assertEqual("portable local rules" in context, include_local)
+				self.assertNotIn("## 本地知识库", context)
 
 
 if __name__ == "__main__":
