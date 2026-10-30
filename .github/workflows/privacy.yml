@@ -23,6 +23,10 @@ jobs:
           PRIVATE_CONTENT_TERMS_JSON: ${{ secrets.PRIVATE_CONTENT_TERMS_JSON }}
           PYTHONDONTWRITEBYTECODE: "1"
         run: python3 scripts/check_private_content.py --history --require-private-terms
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ripgrep
       - name: Run regression tests
         env:
           PYTHONDONTWRITEBYTECODE: "1"
