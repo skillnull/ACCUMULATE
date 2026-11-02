@@ -138,6 +138,47 @@ class SkillnullGateTest(unittest.TestCase):
 		)
 		self.assertEqual(failures, ["源码被清空：src/empty.ts"])
 
+	def test_blocks_unencoded_whitespace_in_static_resource_path(self) -> None:
+		self.write_source(
+			"src/index.html",
+			'<script src=". /dist/device.es.js"></script>\n',
+		)
+		failures = skillnull_gate.current_gate_failures(
+			self.repo_root,
+			{
+				"baseline_diff_check": [],
+				"baseline_resource_path_errors": [],
+				"baseline_zero_sources": [],
+				"touched_files": [],
+			},
+		)
+		self.assertEqual(
+			failures,
+			[
+				"静态资源路径包含未编码空白："
+				"src/index.html:1 attribute src"
+			],
+		)
+
+	def test_allows_normalized_and_dynamic_resource_paths(self) -> None:
+		self.write_source(
+			"src/index.html",
+			'<script src="./dist/device.es.js"></script>\n'
+			'<img :src="assetBase + fileName">\n',
+		)
+		self.assertEqual(
+			skillnull_gate.static_resource_path_errors(self.repo_root), []
+		)
+
+	def test_blocks_unencoded_whitespace_in_style_url(self) -> None:
+		self.write_source(
+			"src/index.css", '.hero { background: url("./hero image.png"); }\n'
+		)
+		self.assertEqual(
+			skillnull_gate.static_resource_path_errors(self.repo_root),
+			["src/index.css:1 style url"],
+		)
+
 	def test_hook_output_is_valid_json(self) -> None:
 		payload = json.dumps(
 			{

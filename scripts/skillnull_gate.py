@@ -41,6 +41,34 @@ SOURCE_SUFFIXES = {
 	".tsx",
 	".vue",
 }
+STATIC_RESOURCE_SUFFIXES = {
+	".css",
+	".html",
+	".jsx",
+	".less",
+	".sass",
+	".scss",
+	".tsx",
+	".vue",
+}
+STATIC_RESOURCE_PATTERNS = (
+	(
+		re.compile(
+			r"(?<![:.@\[\w-])(?P<kind>src|href)\s*=\s*"
+			r"(?P<quote>[\"'])(?P<value>.*?)(?P=quote)",
+			re.IGNORECASE | re.DOTALL,
+		),
+		"attribute",
+	),
+	(
+		re.compile(
+			r"(?P<kind>url)\(\s*(?P<quote>[\"']?)"
+			r"(?P<value>.*?)(?P=quote)\s*\)",
+			re.IGNORECASE | re.DOTALL,
+		),
+		"style",
+	),
+)
 REMOVAL_WORDS = re.compile(
 	r"删除|移除|废弃|下线|清空|重写|替换|remove|delete|deprecate|rewrite|replace",
 	re.IGNORECASE,
@@ -153,6 +181,43 @@ def working_tree_zero_sources(repo_root: Path) -> list[str]:
 		):
 			zero_sources.append(str(target.relative_to(repo_root.resolve())))
 	return sorted(set(zero_sources))
+
+
+def working_tree_paths(repo_root: Path) -> list[Path]:
+	result = run_git(
+		repo_root, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]
+	)
+	if result.returncode != 0:
+		return []
+	paths: list[Path] = []
+	for status_entry in result.stdout.split("\0"):
+		if len(status_entry) < 4:
+			continue
+		target = normalize_target(repo_root, status_entry[3:])
+		if target and target.exists() and target.is_file():
+			paths.append(target)
+	return paths
+
+
+def static_resource_path_errors(repo_root: Path) -> list[str]:
+	repo_root = repo_root.resolve()
+	errors: list[str] = []
+	for target in working_tree_paths(repo_root):
+		if target.suffix.lower() not in STATIC_RESOURCE_SUFFIXES:
+			continue
+		content = target.read_text(encoding="utf-8", errors="replace")
+		for pattern, reference_type in STATIC_RESOURCE_PATTERNS:
+			for match in pattern.finditer(content):
+				value = match.group("value").strip()
+				if value.lower().startswith("data:") or not re.search(r"\s", value):
+					continue
+				line_number = content.count("\n", 0, match.start("value")) + 1
+				relative_target = target.relative_to(repo_root)
+				errors.append(
+					f"{relative_target}:{line_number} "
+					f"{reference_type} {match.group('kind').lower()}"
+				)
+	return sorted(set(errors))
 
 
 def load_skill_context() -> str:
@@ -415,6 +480,16 @@ def current_gate_failures(repo_root: Path, state: dict[str, Any]) -> list[str]:
 	]
 	if new_diff_errors:
 		failures.append(f"新增 diff 格式错误：{new_diff_errors[0]}")
+	baseline_resource_errors = set(state.get("baseline_resource_path_errors", []))
+	new_resource_errors = [
+		error
+		for error in static_resource_path_errors(repo_root)
+		if error not in baseline_resource_errors
+	]
+	if new_resource_errors:
+		failures.append(
+			f"静态资源路径包含未编码空白：{new_resource_errors[0]}"
+		)
 	baseline_zero_sources = set(state.get("baseline_zero_sources", []))
 	for relative_target in working_tree_zero_sources(repo_root):
 		if relative_target not in baseline_zero_sources:
@@ -437,6 +512,7 @@ def handle_user_prompt(payload: dict[str, Any]) -> dict[str, Any]:
 	state = {
 		"removal_authorized": has_removal_authorization(prompt),
 		"baseline_diff_check": diff_check_lines(repo_root),
+		"baseline_resource_path_errors": static_resource_path_errors(repo_root),
 		"baseline_zero_sources": working_tree_zero_sources(repo_root),
 		"touched_files": [],
 	}
