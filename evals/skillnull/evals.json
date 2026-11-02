@@ -145,6 +145,19 @@
         "如无法安全并行则说明阻塞而不是擅自终止服务"
       ],
       "tags": ["build", "explicit-override"]
+    },
+    {
+      "id": 13,
+      "prompt": "为兼容无 DOM 的运行环境，重构一个浏览器 API；该 API 原来默认显示加载状态。",
+      "expected_output": "无 DOM 环境安全跳过页面操作，浏览器端继续保持原有默认加载行为。",
+      "files": [],
+      "assertions": [
+        "不因兼容性重构改变浏览器端默认行为",
+        "新增开关时默认值兼容旧行为",
+        "使用原入口和默认参数补充回归验证",
+        "需要改变业务行为时先说明影响并取得明确授权"
+      ],
+      "tags": ["behavior-compatibility", "regression"]
     }
   ]
 }
