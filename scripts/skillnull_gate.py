@@ -7,15 +7,19 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 
 SKILL_PATH = Path(__file__).resolve().parents[1] / "SKILL.md"
 LOCAL_SKILL_PATH = SKILL_PATH.with_name("SKILL.local.md")
 STATE_ROOT = Path.home() / ".codex" / "state" / "skillnull-gate"
+MAX_CONTEXT_BYTES = 6000
 SOURCE_SUFFIXES = {
 	".c",
 	".cc",
@@ -130,8 +134,11 @@ def state_path(session_id: str) -> Path:
 def load_state(session_id: str) -> dict[str, Any]:
 	path = state_path(session_id)
 	try:
-		return json.loads(path.read_text(encoding="utf-8"))
-	except (FileNotFoundError, json.JSONDecodeError, OSError):
+		state = json.loads(path.read_text(encoding="utf-8"))
+		if not isinstance(state, dict):
+			raise ValueError("会话状态必须是对象")
+		return state
+	except FileNotFoundError:
 		return {}
 
 
@@ -140,13 +147,16 @@ def save_state(session_id: str, state: dict[str, Any]) -> None:
 	if os.name != "nt":
 		STATE_ROOT.chmod(0o700)
 	path = state_path(session_id)
-	temporary_path = path.with_suffix(".tmp")
-	temporary_path.write_text(
-		json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
-	)
-	if os.name != "nt":
-		temporary_path.chmod(0o600)
-	temporary_path.replace(path)
+	with tempfile.NamedTemporaryFile(
+		mode="w", encoding="utf-8", dir=STATE_ROOT, delete=False
+	) as temporary_file:
+		temporary_path = Path(temporary_file.name)
+		try:
+			json.dump(state, temporary_file, ensure_ascii=False, indent=2)
+			temporary_file.flush()
+			temporary_path.replace(path)
+		finally:
+			temporary_path.unlink(missing_ok=True)
 
 
 def clear_state(session_id: str) -> None:
@@ -162,25 +172,21 @@ def diff_check_lines(repo_root: Path) -> list[str]:
 
 
 def working_tree_zero_sources(repo_root: Path) -> list[str]:
-	result = run_git(
-		repo_root, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]
-	)
-	if result.returncode != 0:
-		return []
-	zero_sources: list[str] = []
-	for status_entry in result.stdout.split("\0"):
-		if len(status_entry) < 4:
-			continue
-		relative_target = status_entry[3:]
-		target = normalize_target(repo_root, relative_target)
-		if (
-			target
-			and target.suffix.lower() in SOURCE_SUFFIXES
-			and target.exists()
-			and target.stat().st_size == 0
-		):
-			zero_sources.append(str(target.relative_to(repo_root.resolve())))
-	return sorted(set(zero_sources))
+	return sorted({
+		str(target.relative_to(repo_root.resolve()))
+		for target in working_tree_paths(repo_root)
+		if target.suffix.lower() in SOURCE_SUFFIXES and target.stat().st_size == 0
+	})
+
+
+def workspace_files(workspace: Path) -> list[Path]:
+	paths: list[Path] = []
+	for directory, folders, files in os.walk(workspace):
+		folders[:] = [name for name in folders if name not in {
+			".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv"
+		} and not (Path(directory) / name).resolve().is_relative_to(STATE_ROOT.resolve())]
+		paths.extend(Path(directory) / name for name in files)
+	return paths
 
 
 def working_tree_paths(repo_root: Path) -> list[Path]:
@@ -188,12 +194,17 @@ def working_tree_paths(repo_root: Path) -> list[Path]:
 		repo_root, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]
 	)
 	if result.returncode != 0:
-		return []
+		if find_repo_root(str(repo_root)) is not None:
+			raise OSError("无法读取 Git 工作区状态")
+		return [target for target in workspace_files(repo_root) if target.is_file()]
 	paths: list[Path] = []
-	for status_entry in result.stdout.split("\0"):
+	status_entries = iter(result.stdout.split("\0"))
+	for status_entry in status_entries:
 		if len(status_entry) < 4:
 			continue
 		target = normalize_target(repo_root, status_entry[3:])
+		if "R" in status_entry[:2] or "C" in status_entry[:2]:
+			next(status_entries, None)
 		if target and target.exists() and target.is_file():
 			paths.append(target)
 	return paths
@@ -220,11 +231,238 @@ def static_resource_path_errors(repo_root: Path) -> list[str]:
 	return sorted(set(errors))
 
 
-def load_skill_context() -> str:
-	sections = [SKILL_PATH.read_text(encoding="utf-8")]
+def markdown_blocks(content: str) -> list[tuple[int, str]]:
+	"""Keep every prose/list/code block; interpret no rule-specific keywords."""
+	blocks: list[tuple[int, str]] = []
+	current_lines: list[str] = []
+	start_line = 1
+	fence = ""
+	frontmatter = content.startswith("---\n")
+	for line_number, line in enumerate(content.splitlines(), 1):
+		if frontmatter:
+			if line_number > 1 and line.strip() == "---":
+				frontmatter = False
+			continue
+		fence_match = re.match(r"^\s{0,3}(`{3,}|~{3,})", line)
+		if fence_match:
+			marker = fence_match.group(1)
+			if not fence:
+				fence = marker
+			elif marker[0] == fence[0] and len(marker) >= len(fence):
+				fence = ""
+		elif not fence:
+			is_heading = bool(re.match(r"^#{1,6}\s", line))
+			is_item = bool(re.match(r"^\s{0,3}(?:\d+[.)]|[-+*])\s+", line))
+			if not line.strip() or is_heading or is_item:
+				if current_lines:
+					blocks.append((start_line, "\n".join(current_lines).strip()))
+					current_lines = []
+				if not line.strip() or is_heading:
+					continue
+		if not current_lines:
+			start_line = line_number
+		current_lines.append(line)
+	if current_lines:
+		blocks.append((start_line, "\n".join(current_lines).strip()))
+	return blocks
+
+
+def load_rule_bundle() -> dict[str, Any]:
+	"""Discover the current policy graph from the installation, never the project."""
+	root = SKILL_PATH.resolve().parent
+	pending = [SKILL_PATH.resolve()]
 	if LOCAL_SKILL_PATH.exists():
-		sections.append(LOCAL_SKILL_PATH.read_text(encoding="utf-8"))
-	return "\n\n--- SKILLNULL 本机扩展 ---\n\n".join(sections)
+		pending.append(LOCAL_SKILL_PATH.resolve())
+	sources: dict[str, str] = {}
+	rules: list[dict[str, Any]] = []
+	while pending:
+		target = pending.pop(0)
+		try:
+			relative_path = target.relative_to(root).as_posix()
+		except ValueError as error:
+			raise ValueError("规则引用越出全局安装目录") from error
+		if target.suffix.lower() != ".md":
+			raise ValueError("规则引用必须指向 Markdown 文件")
+		if relative_path in sources:
+			continue
+		content = target.read_text(encoding="utf-8")
+		if not content.strip():
+			raise ValueError("规则文件为空")
+		sources[relative_path] = content
+		headings: list[tuple[int, str]] = []
+		sections: dict[int, list[str]] = {}
+		fence = ""
+		for line_number, line in enumerate(content.splitlines(), 1):
+			fence_match = re.match(r"^\s{0,3}(`{3,}|~{3,})", line)
+			if fence_match:
+				marker = fence_match.group(1)
+				if not fence:
+					fence = marker
+				elif marker[0] == fence[0] and len(marker) >= len(fence):
+					fence = ""
+			heading = re.match(r"^(#{1,6})\s+(.+)$", line) if not fence else None
+			if heading:
+				level = len(heading.group(1))
+				headings = [item for item in headings if item[0] < level]
+				headings.append((level, heading.group(2)))
+			sections[line_number] = [title for heading_level, title in headings]
+		for line_number, text in markdown_blocks(content):
+			digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+			rules.append({
+				"id": f"{relative_path}:{line_number}:{digest}",  # Source-bound review key.
+				"source": relative_path,  # Path relative to the global installation.
+				"line": line_number,  # First line of this policy block.
+				"section": sections[line_number],  # Conditions and prohibitions in headings.
+				"text": text,  # Current requirement, including its conditions.
+			})
+		for raw_link in re.findall(r"\[[^\]]+\]\(([^)]+)\)", content):
+			link = urlsplit(raw_link.strip().strip("<>"))
+			if link.scheme or link.netloc or not link.path:
+				continue
+			linked_path = Path(unquote(link.path))
+			if linked_path.suffix.lower() == ".md":
+				pending.append((target.parent / linked_path).resolve())
+	if not rules:
+		raise ValueError("规则文件不含可审查内容")
+	fingerprint = hashlib.sha256(json.dumps(
+		sources, ensure_ascii=False, sort_keys=True
+	).encode("utf-8")).hexdigest()
+	return {
+		"revision": fingerprint,  # Digest of every discovered rule source.
+		"sources": sources,  # Complete current Markdown, keyed by relative path.
+		"rules": rules,  # Review units discovered without fixed numbers or counts.
+	}
+
+
+def load_skill_context(bundle: dict[str, Any] | None = None) -> str:
+	bundle = bundle or load_rule_bundle()
+	return "\n\n".join(
+		f"--- SKILLNULL 来源：{relative_path} ---\n\n{content}"
+		for relative_path, content in bundle["sources"].items()
+	)
+
+
+def workspace_revision(workspace: Path) -> str:
+	"""Bind delivery reviews to actual files and staging, excluding hook state."""
+	workspace = workspace.resolve()
+	digest = hashlib.sha256()
+	repo_root = find_repo_root(str(workspace))
+	if repo_root:
+		for arguments in (["rev-parse", "HEAD"], ["diff", "--cached", "--binary"]):
+			result = run_git(repo_root, arguments)
+			digest.update(result.stdout.encode("utf-8"))
+		result = run_git(repo_root, [
+			"ls-files", "-z", "--modified", "--deleted", "--others", "--exclude-standard"
+		])
+		if result.returncode:
+			raise OSError("无法读取工作区文件状态")
+		paths = [repo_root / value for value in result.stdout.split("\0") if value]
+	else:
+		paths = workspace_files(workspace)
+	for target in sorted(set(paths)):
+		if target.resolve().is_relative_to(STATE_ROOT.resolve()):
+			continue
+		digest.update(str(target.relative_to(workspace)).encode("utf-8"))
+		if target.is_symlink():
+			digest.update(os.readlink(target).encode("utf-8"))
+		elif target.is_file():
+			with target.open("rb") as source_file:
+				for chunk in iter(lambda: source_file.read(1024 * 1024), b""):
+					digest.update(chunk)
+		else:
+			digest.update(b"<deleted>")
+	return digest.hexdigest()
+
+
+def review_failures(
+	review: Any, bundle: dict[str, Any], phase: str, revision: str
+) -> list[str]:
+	if not isinstance(review, dict):
+		return [f"缺少 {phase} 逐条审查"]
+	if review.get("phase") != phase:
+		return ["审查阶段不匹配"]
+	if review.get("policy_revision") != bundle["revision"]:
+		return ["规则已变动，旧审查失效"]
+	if phase == "delivery" and review.get("workspace_revision") != revision:
+		return ["工作区已变动，须重新验证并审查"]
+	entries = review.get("entries")
+	if not isinstance(entries, list):
+		return ["逐条审查 entries 必须是数组"]
+	known_ids = {rule["id"] for rule in bundle["rules"]}
+	seen_ids: set[str] = set()
+	failures: list[str] = []
+	accepted = {"planned", "not_applicable"} if phase == "plan" else {
+		"verified", "not_applicable"
+	}
+	if phase == "delivery" and review.get("outcome") == "incomplete":
+		accepted.add("blocked")
+	for entry in entries:
+		if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+			failures.append("逐条审查条目必须含字符串 id")
+			continue
+		rule_id = entry["id"]
+		if rule_id not in known_ids or rule_id in seen_ids:
+			failures.append("逐条审查含未知或重复规则")
+		seen_ids.add(rule_id)
+		if entry.get("status") not in accepted:
+			failures.append(f"规则尚未通过审查：{rule_id}")
+		for field in ("reason", "evidence"):
+			value = entry.get(field)
+			if not isinstance(value, str) or not value.strip():
+				failures.append(f"规则缺少 {field}：{rule_id}")
+	missing = known_ids - seen_ids
+	if missing:
+		failures.append(f"漏审 {len(missing)} 条规则：{sorted(missing)[0]}")
+	return list(dict.fromkeys(failures))
+
+
+def review_instructions(session_id: str, workspace: Path) -> str:
+	command = shlex.join([
+		sys.executable, str(Path(__file__).resolve()), "review",
+		"--session", session_id, "--cwd", str(workspace),
+	])
+	return (
+		"开发任务须完整读取最新规则，可分段读取来源文件，"
+		"或运行下列命令的 snapshot 子命令（将 review 改为 snapshot）。"
+		"获取动态规则 id、policy_revision 和 workspace_revision；"
+		"snapshot 支持 --offset 与 --limit 分页，必须读完 total_rules 条。"
+		"按每条原文判断触发条件，禁止批量填充或以已读取代替遵守。\n"
+		f"{command}\n"
+		"review 从标准输入接收 JSON：phase 为 plan 或 delivery，"
+		"同时提交 policy_revision、workspace_revision、entries。"
+		"每条 entries 含 id、status、reason、evidence。"
+		"开发前 status 用 planned 或 not_applicable，说明执行计划及适用依据；"
+		"交付前用 verified 或 not_applicable，给出实际检查证据或不适用依据。"
+		"未验证、失败或阻塞不得标 verified，须继续处理或如实报告未完成。"
+		"确实无法完成时，delivery 可用 outcome=incomplete 与 status=blocked，"
+		"逐项列出阻塞证据，最终答复必须明确未完成。"
+		"语义条款由代理据证审查，脚本仅校验覆盖、版本与必填证据，不证明语义正确。"
+		"审查仅存全局会话状态，不写业务仓库，不提交密钥、个人数据或私有词库。"
+		"普通非开发问答不启用审查，不运行无关命令。"
+	)
+
+
+def is_read_only_tool(payload: dict[str, Any]) -> bool:
+	"""Retain a narrow diagnostic path when policy or state cannot be loaded."""
+	tool_name = str(payload.get("tool_name") or "").lower()
+	if tool_name in {"read", "read_file", "list_directory", "glob", "grep"}:
+		return True
+	if tool_name not in {"bash", "exec_command"}:
+		return False
+	text = extract_tool_text(payload)
+	if re.search(r"[;&|<>`$\n]", text):
+		return False
+	try:
+		arguments = shlex.split(text)
+	except ValueError:
+		return False
+	if not arguments:
+		return False
+	if arguments[0] in {"cat", "head", "tail", "pwd", "wc", "ls", "rg", "readlink"}:
+		return not any(argument.startswith(("--pre", "--hostname-bin")) for argument in arguments)
+	return len(arguments) > 1 and arguments[0] == "git" and arguments[1] in {
+		"status", "diff", "log", "show", "ls-files", "rev-parse"
+	} and not any(argument.startswith(("--output", "--ext-diff", "--textconv")) for argument in arguments)
 
 
 def extract_prompt(payload: dict[str, Any]) -> str:
@@ -247,7 +485,7 @@ def extract_tool_text(payload: dict[str, Any]) -> str:
 		return tool_input
 	if not isinstance(tool_input, dict):
 		return ""
-	for key in ("patch", "input", "command", "cmd"):
+	for key in ("patch", "input", "command", "cmd", "code"):
 		value = tool_input.get(key)
 		if isinstance(value, str):
 			return value
@@ -503,121 +741,253 @@ def current_gate_failures(repo_root: Path, state: dict[str, Any]) -> list[str]:
 	return list(dict.fromkeys(failures))
 
 
-def handle_user_prompt(payload: dict[str, Any]) -> dict[str, Any]:
-	repo_root = find_repo_root(payload.get("cwd"))
-	if repo_root is None:
-		return {}
-	session_id = str(payload.get("session_id") or "unknown-session")
-	prompt = extract_prompt(payload)
-	state = {
-		"removal_authorized": has_removal_authorization(prompt),
-		"baseline_diff_check": diff_check_lines(repo_root),
-		"baseline_resource_path_errors": static_resource_path_errors(repo_root),
-		"baseline_zero_sources": working_tree_zero_sources(repo_root),
-		"touched_files": [],
-	}
-	try:
-		skill_context = load_skill_context()
-		state["skill_loaded"] = True
-		state["skill_hash"] = hashlib.sha256(
-			skill_context.encode("utf-8")
-		).hexdigest()
-	except OSError as error:
-		state["skill_loaded"] = False
-		skill_context = f"SKILLNULL 读取失败，禁止修改代码：{error.__class__.__name__}"
-	save_state(session_id, state)
+def payload_workspace(payload: dict[str, Any]) -> Path:
+	cwd = Path(payload.get("cwd") or os.getcwd()).expanduser().resolve()
+	return find_repo_root(str(cwd)) or cwd
+
+
+def initial_state(workspace: Path) -> dict[str, Any]:
+	is_repository = find_repo_root(str(workspace)) is not None
 	return {
-		"hookSpecificOutput": {
-			"hookEventName": "UserPromptSubmit",
-			"additionalContext": (
-				"全局 SKILLNULL 门禁已启用。以下规则由全局本地 Hook 直接加载，"
-				"必须逐条执行。关键删除另由工具门禁强制校验。\n\n"
-				+ skill_context
-			),
-		}
+		"workspace": str(workspace),  # Workspace to which this session is bound.
+		"baseline_workspace": workspace_revision(workspace),  # Original file state.
+		"baseline_diff_check": diff_check_lines(workspace) if is_repository else [],
+		"baseline_resource_path_errors": static_resource_path_errors(workspace),
+		"baseline_zero_sources": working_tree_zero_sources(workspace),
+		"touched_files": [],  # Explicit patch targets used by safety checks.
+		"active": False,  # Only development reviews or observed edits activate audits.
 	}
+
+
+def session_state(session_id: str, workspace: Path) -> dict[str, Any]:
+	state = load_state(session_id)
+	if state and "workspace" not in state:
+		state = {**initial_state(workspace), **state}
+	if state and state.get("workspace") != str(workspace):
+		raise ValueError("会话工作目录变动，须重新建立本轮基线")
+	if state:
+		if not isinstance(state.get("baseline_workspace"), str) or not isinstance(state.get("active"), bool):
+			raise ValueError("会话基线损坏")
+		for field in ("baseline_diff_check", "baseline_resource_path_errors", "baseline_zero_sources", "touched_files"):
+			values = state.get(field)
+			if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+				raise ValueError("会话检查基线损坏")
+	return state or initial_state(workspace)
+
+
+def rule_context(
+	state: dict[str, Any], bundle: dict[str, Any], session_id: str,
+	workspace: Path, force: bool = False,
+) -> str:
+	if not force and state.get("skill_hash") == bundle["revision"]:
+		return ""
+	state["skill_loaded"] = True
+	state["skill_hash"] = bundle["revision"]
+	context = (
+		"全局 SKILLNULL 动态门禁：逐条遵守以下最新规则及其适用条件。"
+		"新增、删改、引用变更会使旧审查失效。\n"
+		+ review_instructions(session_id, workspace)
+		+ "\n\n" + load_skill_context(bundle)
+	)
+	if len(context.encode("utf-8")) > MAX_CONTEXT_BYTES:
+		return (
+			"全局 SKILLNULL — 编写与迭代守则：规则包超过注入上限。"
+			"以下仅为加载指令，不是规则摘要。必须通过 snapshot 分页完整读取"
+			"全部规则与本机扩展，再逐条审查；不能只看首尾预览。\n"
+			+ review_instructions(session_id, workspace)
+		)
+	return context
+
+
+def context_output(event: str, context: str) -> dict[str, Any]:
+	return {"hookSpecificOutput": {
+		"hookEventName": event,  # Event receiving this model-visible context.
+		"additionalContext": context,  # Current rules or actionable gate failures.
+	}} if context else {}
+
+
+def handle_user_prompt(payload: dict[str, Any]) -> dict[str, Any]:
+	workspace = payload_workspace(payload)
+	session_id = str(payload.get("session_id") or "unknown-session")
+	state = session_state(session_id, workspace)
+	prompt = extract_prompt(payload)
+	if REMOVAL_DENIAL_WORDS.search(prompt):
+		state["removal_authorized"] = False
+	elif has_removal_authorization(prompt):
+		state["removal_authorized"] = True
+	bundle = load_rule_bundle()
+	context = rule_context(state, bundle, session_id, workspace, force=True)
+	save_state(session_id, state)
+	return context_output(str(payload.get("hook_event_name") or "UserPromptSubmit"), context)
 
 
 def handle_pre_tool(payload: dict[str, Any]) -> dict[str, Any]:
-	repo_root = find_repo_root(payload.get("cwd"))
-	if repo_root is None:
-		return {}
+	repo_root = payload_workspace(payload)
 	session_id = str(payload.get("session_id") or "unknown-session")
-	state = load_state(session_id)
-	tool_name = str(payload.get("tool_name") or "")
+	state = session_state(session_id, repo_root)
+	bundle = load_rule_bundle()
+	context = rule_context(state, bundle, session_id, repo_root)
+	tool_name = str(payload.get("tool_name") or "").lower()
 	tool_text = extract_tool_text(payload)
-	if "apply_patch" in tool_name.lower() and not state.get("skill_loaded"):
-		return deny_pretool(
-			"SKILLNULL 门禁：本轮尚未由全局 Hook 成功加载完整规则，禁止修改代码。"
-		)
-	if tool_name.lower() in {"bash", "exec_command"}:
+	is_patch = "apply_patch" in tool_name
+	is_edit = is_patch or tool_name in {"edit", "write"}
+	if is_edit:
+		failures = review_failures(state.get("plan"), bundle, "plan", "")
+		if failures:
+			save_state(session_id, state)
+			result = deny_pretool("SKILLNULL 门禁：" + "；".join(failures)
+				+ "。先按动态清单完成开发前审查。\n"
+				+ review_instructions(session_id, repo_root))
+			if context:
+				result["hookSpecificOutput"]["additionalContext"] = context
+			return result
+	if tool_name in {"bash", "exec_command"} or tool_name.endswith("__exec_command"):
 		for destructive_pattern in DESTRUCTIVE_COMMANDS:
 			if destructive_pattern.search(tool_text):
 				return deny_pretool(
 					"SKILLNULL 门禁：已阻止直接破坏或原地重写命令。"
 					"请先核对影响与引用，再用可审查的 apply_patch 执行。"
 				)
-	if "apply_patch" in tool_name.lower():
+	if is_patch:
 		reason, touched = check_patch(
 			repo_root, tool_text, bool(state.get("removal_authorized"))
 		)
 		state["touched_files"] = sorted(
 			set(state.get("touched_files", [])) | set(touched)
 		)
-		save_state(session_id, state)
 		if reason:
 			return deny_pretool(reason)
-	return {}
+	save_state(session_id, state)
+	return context_output("PreToolUse", context)
 
 
 def handle_post_tool(payload: dict[str, Any]) -> dict[str, Any]:
-	repo_root = find_repo_root(payload.get("cwd"))
-	if repo_root is None:
-		return {}
+	repo_root = payload_workspace(payload)
 	session_id = str(payload.get("session_id") or "unknown-session")
-	failures = current_gate_failures(repo_root, load_state(session_id))
-	if not failures:
-		return {}
-	return {
-		"hookSpecificOutput": {
-			"hookEventName": "PostToolUse",
-			"additionalContext": "SKILLNULL 门禁未通过：" + "；".join(failures),
-		}
-	}
+	state = session_state(session_id, repo_root)
+	bundle = load_rule_bundle()
+	context = rule_context(state, bundle, session_id, repo_root)
+	if workspace_revision(repo_root) != state["baseline_workspace"]:
+		state["active"] = True
+	failures = current_gate_failures(repo_root, state)
+	if failures:
+		context += "\nSKILLNULL 门禁未通过：" + "；".join(failures)
+	save_state(session_id, state)
+	return context_output("PostToolUse", context.strip())
 
 
 def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
-	if payload.get("stop_hook_active"):
-		return {}
-	repo_root = find_repo_root(payload.get("cwd"))
-	if repo_root is None:
-		return {}
+	repo_root = payload_workspace(payload)
 	session_id = str(payload.get("session_id") or "unknown-session")
-	failures = current_gate_failures(repo_root, load_state(session_id))
+	if not load_state(session_id):
+		return {"decision": "block", "reason": "SKILLNULL 会话基线缺失，不能判定交付通过。"}
+	state = session_state(session_id, repo_root)
+	bundle = load_rule_bundle()
+	revision = workspace_revision(repo_root)
+	failures = current_gate_failures(repo_root, state)
+	if state.get("active") or revision != state["baseline_workspace"]:
+		failures.extend(review_failures(state.get("plan"), bundle, "plan", revision))
+		failures.extend(review_failures(state.get("delivery"), bundle, "delivery", revision))
 	if not failures:
 		clear_state(session_id)
 		return {}
 	return {
 		"decision": "block",
-		"reason": "SKILLNULL 全局门禁阻止结束：" + "；".join(failures),
+		"reason": "SKILLNULL 全局门禁阻止结束：" + "；".join(failures[:8])
+			+ "。原有基线和审查状态继续保留；不得跳过后续结束检查。\n"
+			+ review_instructions(session_id, repo_root),
 	}
 
 
+def handle_review_cli() -> int:
+	import argparse
+
+	parser = argparse.ArgumentParser(description="Review the current dynamic policy.")
+	parser.add_argument("action", choices=("snapshot", "review"))
+	parser.add_argument("--session", required=True)
+	parser.add_argument("--cwd", type=Path, default=Path.cwd())
+	parser.add_argument("--offset", type=int, default=0)
+	parser.add_argument("--limit", type=int, default=10)
+	options = parser.parse_args()
+	workspace = payload_workspace({"cwd": str(options.cwd)})
+	bundle = load_rule_bundle()
+	state = session_state(options.session, workspace)
+	revision = workspace_revision(workspace)
+	if options.action == "snapshot":
+		if options.offset < 0 or options.limit < 1:
+			raise ValueError("分页范围无效")
+		emit({
+			"policy_revision": bundle["revision"],  # Current complete policy digest.
+			"workspace_revision": revision,  # Actual working files and staged changes.
+			"total_rules": len(bundle["rules"]),  # Read all pages before reviewing.
+			"offset": options.offset,  # Start index of the current page.
+			"rules": bundle["rules"][options.offset:options.offset + options.limit],
+			# Dynamically discovered IDs and full requirements on the selected page.
+		})
+		return 0
+	review = json.load(sys.stdin)
+	phase = review.get("phase") if isinstance(review, dict) else None
+	if phase not in {"plan", "delivery"}:
+		raise ValueError("phase 必须是 plan 或 delivery")
+	failures = review_failures(review, bundle, phase, revision)
+	if phase == "delivery":
+		failures.extend(review_failures(state.get("plan"), bundle, "plan", revision))
+		failures.extend(current_gate_failures(workspace, state))
+	if failures:
+		emit({
+			"status": "rejected",  # Review was not recorded.
+			"failures": failures,  # Requirements preventing acceptance.
+		})
+		return 1
+	state[phase] = review
+	state["active"] = True
+	save_state(options.session, state)
+	emit({
+		"status": "accepted",  # Review was recorded for this session.
+		"phase": phase,  # Accepted review stage.
+		"rule_count": len(bundle["rules"]),  # Complete required coverage.
+	})
+	return 0
+
+
 def main() -> int:
+	if len(sys.argv) > 1:
+		try:
+			return handle_review_cli()
+		except (OSError, ValueError, TypeError) as error:
+			emit({"status": "rejected", "error": error.__class__.__name__})
+			return 1
 	try:
 		payload = json.load(sys.stdin)
-	except (json.JSONDecodeError, OSError):
-		emit({})
-		return 0
+	except (ValueError, OSError):
+		print("SKILLNULL 门禁输入无效，未完成校验。", file=sys.stderr)
+		return 2
+	if not isinstance(payload, dict):
+		print("SKILLNULL 门禁输入必须是 JSON 对象。", file=sys.stderr)
+		return 2
 	event_name = str(payload.get("hook_event_name") or "")
 	handlers = {
+		"SessionStart": handle_user_prompt,
+		"PostCompact": handle_user_prompt,
 		"UserPromptSubmit": handle_user_prompt,
 		"PreToolUse": handle_pre_tool,
 		"PostToolUse": handle_post_tool,
 		"Stop": handle_stop,
 	}
 	handler = handlers.get(event_name)
-	emit(handler(payload) if handler else {})
+	try:
+		emit(handler(payload) if handler else {})
+	except (OSError, ValueError, TypeError) as error:
+		reason = "SKILLNULL 门禁校验失败：" + error.__class__.__name__
+		if event_name == "PreToolUse":
+			if is_read_only_tool(payload):
+				emit(context_output(event_name, reason + "。仅允许只读诊断，请先恢复规则或状态。"))
+			else:
+				emit(deny_pretool(reason + "。恢复规则或状态后重试；本次工具尚未执行。"))
+		elif event_name == "Stop":
+			emit({"decision": "block", "reason": reason})
+		else:
+			emit(context_output(event_name, reason))
 	return 0
 
 
