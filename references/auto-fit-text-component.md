@@ -7,12 +7,11 @@
 - 每次测量先清除旧字号、宽度、截断及省略状态，从 max 或继承字号重算；容纳则保持，溢出逐级缩小，min 仍溢出才省略。
 - 明确 content/children、min、可选 max、lines（默认 1）、安全 tag 及属性/事件透传。字体、字重、颜色和对齐继承宿主，不加业务特例。
 - min/max 明确采用设计 px 或当前 CSS px：分别按构建 rootValue 或当前根字号转 rem；不混用 DOM px 与设计 px。
-- DOM 保留完整文本；纯文本默认转义。HTML 仅显式开启且已安全处理；字号不得低于可读性下限，必要时调整布局或提供全文入口。
+- 纯文本默认转义。HTML 仅显式开启且已安全处理；字号不得低于可读性下限，必要时调整布局或提供全文入口。
 
 ## 布局与测量
 
-1. 宿主和必要中间层设置 min-width: 0；文本 max-width: 100%、overflow: hidden。单行 nowrap，省略状态才开启 ellipsis。
-   名称与旁边数值的同高居中按 [文字环绕与混合字体对齐](inline-wrap-mixed-font-alignment.md) 处理。使用自定义 slot 或 SVG 文本时，父容器的 text-overflow 不保证实际出现省略号；必须检查最终文字层，禁止把末字截半当作省略已实现。
+1. 宽度约束、原生省略、完整原文及自定义 slot/SVG 裁切检查统一遵守 [文本省略与兼容](../rules/text-ellipsis.md)。名称与旁边数值的同高居中按 [文字环绕与混合字体对齐](inline-wrap-mixed-font-alignment.md) 处理。
 2. 用浮点 DOMRect 读取真实分配宽度，结合父级内容宽度（扣 border/padding），取有效正值最小约束。不靠兄弟宽度反推。
    flex 文本缩小后，自身宽度可能不随剩余空间增长；此时需观察父容器及相关兄弟的宽度变化来重测。同宽更新不触发，任务按帧合并。
 3. 单行用 Range.selectNodeContents 后的 DOMRect.width 比较；小容差仅吸收取整，不遮盖裁切。
@@ -20,8 +19,6 @@
 5. 宽度为 0 时不缩小；帧级重试有上限，等待真实尺寸/可见性变化后重测。
 6. 从最大字号逐级缩至 min，在 min 再测后决定省略。仅经性能证明需要时用二分，结果必须是可容纳的最大字号并做 DOM 复测。
 7. 不用 transform: scale 替代字号；canvas 仅可估算起点，最终结果必须经 DOM 校验。多行行高可能随字号变化，不能错误缓存。
-
-多行可用 -webkit-box/line-clamp；低版本不支持 overflow-wrap: anywhere 时用项目已验证的换行策略。
 
 ## 组织与性能
 

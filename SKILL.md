@@ -86,6 +86,7 @@ metadata:
 - 涉及吸顶 Header、吸顶锚点、滚动选中、锚点点击定位、吸顶间隙或滚动抖动时，必须读取并遵守 [吸顶锚点稳定性](references/sticky-anchor-stability.md)。
 - 涉及段落标签与正文自然环绕、中文与数字混排、不同字号或图标的垂直居中时，必须读取并遵守 [文字环绕与混合字体对齐](references/inline-wrap-mixed-font-alignment.md)：先统一子项高度并 flex 居中，再校正原字体字形；使用三端共用方案，覆盖正负零及主辅行，不以盒子或单一样例代替整体验证。
 - 涉及固定宽度、flex/grid 单元格内长文本或数值的字号自适应，需要“先缩小字号，到下限后再省略”时，必须读取并遵守 [自适应字号文本组件](references/auto-fit-text-component.md)。
+- 涉及单行、多行文本省略或字号缩至下限后的截断时，必须读取并遵守 [文本省略与兼容](rules/text-ellipsis.md)。
 - 涉及前端首屏 LCP 过高、主视觉晚出现、远程活动图 WebP、首屏资源预加载、共享启动链减负、全局依赖拆包或框架启动阻塞首屏绘制时，必须读取并遵守 [前端 LCP 稳定首屏优化](references/frontend-lcp-stable-hero.md)。
 
 ## 本地扩展
