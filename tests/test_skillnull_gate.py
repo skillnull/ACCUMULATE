@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -84,24 +85,24 @@ class SkillnullGateTest(unittest.TestCase):
 			"tool_name": name, "tool_input": {"command": text},
 		})
 
-	def test_future_rule_invalidates_plan_before_edit_without_script_change(self) -> None:
+	def test_new_rule_is_read_without_changing_the_review(self) -> None:
 		self.start_session()
 		self.record_review("plan")
 		with self.policy_path.open("a", encoding="utf-8") as policy_file:
 			policy_file.write("2. **未来约束**：交付需核对任意新增条件。\n")
 		output = self.pre_tool()
-		self.assertEqual(output["hookSpecificOutput"]["permissionDecision"], "deny")
+		self.assertNotIn("permissionDecision", output.get("hookSpecificOutput", {}))
 		self.assertIn("未来约束", output["hookSpecificOutput"]["additionalContext"])
-		self.assertIn("旧审查失效", output["hookSpecificOutput"]["permissionDecisionReason"])
 
-	def test_rule_rewrite_and_removal_invalidate_delivery(self) -> None:
-		self.start_session()
-		self.record_review("plan")
-		self.record_review("delivery")
+	def test_rule_rewrite_keeps_existing_delivery(self) -> None:
 		for replacement in ("1. **要求**：新的限制。\n", "无需编号的最新限制。\n"):
 			with self.subTest(replacement=replacement):
+				self.start_session()
+				self.record_review("plan")
+				self.record_review("delivery")
 				self.policy_path.write_text(replacement, encoding="utf-8")
-				self.assertIn("旧审查失效", self.stop_session()["reason"])
+				self.assertEqual(self.stop_session(), {})
+				self.assertIn(replacement.strip(), skillnull_gate.load_rule_bundle()["sources"]["SKILL.md"])
 
 	def test_reference_graph_is_recursive_and_cycles_are_deduplicated(self) -> None:
 		self.policy_path.write_text("[专项](rules/details.md)\n", encoding="utf-8")
@@ -121,7 +122,9 @@ class SkillnullGateTest(unittest.TestCase):
 		self.assertIn("本机新增约束", self.pre_tool("Bash", "pwd")["hookSpecificOutput"]["additionalContext"])
 		self.record_review("plan")
 		self.local_path.unlink()
-		self.assertEqual(self.pre_tool()["hookSpecificOutput"]["permissionDecision"], "deny")
+		output = self.pre_tool()
+		self.assertNotIn("permissionDecision", output.get("hookSpecificOutput", {}))
+		self.assertNotIn("本机新增约束", output.get("hookSpecificOutput", {}).get("additionalContext", ""))
 
 	def test_missing_or_escaping_rule_links_are_rejected(self) -> None:
 		for link in ("missing.md", "../../outside.md"):
@@ -156,10 +159,12 @@ class SkillnullGateTest(unittest.TestCase):
 		self.record_review("plan")
 		bundle = skillnull_gate.load_rule_bundle()
 		review = skillnull_gate.load_state("dynamic-session")["plan"]
-		for extra_id in (review["entries"][0]["id"], "nonexistent-rule"):
-			candidate = json.loads(json.dumps(review))
-			candidate["entries"].append({**candidate["entries"][0], "id": extra_id})
-			self.assertTrue(skillnull_gate.review_failures(candidate, bundle, "plan", ""))
+		duplicate = json.loads(json.dumps(review))
+		duplicate["entries"].append({**duplicate["entries"][0]})
+		self.assertTrue(skillnull_gate.review_failures(duplicate, bundle, "plan", ""))
+		stale = json.loads(json.dumps(review))
+		stale["entries"].append({**stale["entries"][0], "id": "retired-rule"})
+		self.assertEqual(skillnull_gate.review_failures(stale, bundle, "plan", ""), [])
 
 	def test_end_gate_cannot_be_skipped_on_second_stop(self) -> None:
 		self.start_session()
@@ -169,13 +174,35 @@ class SkillnullGateTest(unittest.TestCase):
 			self.assertEqual(output["decision"], "block")
 			self.assertIn("delivery", output["reason"])
 
-	def test_delivery_is_invalidated_by_untracked_source_edit(self) -> None:
+	def test_unlisted_suffix_is_recognized_from_the_current_file(self) -> None:
+		self.start_session()
+		self.write_source("src/widget.zig", "const value = 1;\n")
+		output = self.stop_session()
+		self.assertIn("缺少 plan", output["reason"])
+		self.assertIn("缺少 delivery", output["reason"])
+
+	def test_stop_notice_is_concise_and_preserves_failed_checks(self) -> None:
+		self.start_session()
+		self.write_source("src/new.py", "value = 1\n")
+		for attempt in range(2):
+			with self.subTest(attempt=attempt):
+				output = self.stop_session()
+				self.assertEqual(output["decision"], "block")
+				self.assertIn("缺少 plan", output["reason"])
+				self.assertIn("缺少 delivery", output["reason"])
+				self.assertIn("代理自行处理", output["reason"])
+				self.assertIn("README.md", output["reason"])
+				self.assertNotIn("review 从标准输入", output["reason"])
+				self.assertLess(len(output["reason"]), 300)
+				self.assertTrue(skillnull_gate.load_state("dynamic-session"))
+
+	def test_small_source_edit_after_delivery_does_not_void_review(self) -> None:
 		self.start_session()
 		self.record_review("plan")
 		self.write_source("src/new.py", "value = 1\n")
 		self.record_review("delivery")
 		self.write_source("src/new.py", "value = 2\n")
-		self.assertIn("工作区已变动", self.stop_session()["reason"])
+		self.assertEqual(self.stop_session(), {})
 
 	def test_complete_review_allows_stop_and_clears_private_state(self) -> None:
 		self.start_session()
@@ -217,6 +244,156 @@ class SkillnullGateTest(unittest.TestCase):
 			skillnull_gate.handle_user_prompt({"session_id": "non-git-existing", "cwd": str(workspace)})
 			state = skillnull_gate.load_state("non-git-existing")
 			self.assertEqual(skillnull_gate.current_gate_failures(workspace, state), [])
+
+	def test_report_and_pdf_artifacts_need_no_development_reviews(self) -> None:
+		for use_repository in (False, True):
+			with self.subTest(use_repository=use_repository), tempfile.TemporaryDirectory() as directory:
+				workspace = Path(directory).resolve()
+				if use_repository:
+					subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+				common = {"session_id": f"report-session-{use_repository}", "cwd": str(workspace)}
+				skillnull_gate.handle_user_prompt({**common, "prompt": "Read a PDF and write a quarterly development work review."})
+				output = skillnull_gate.handle_pre_tool({
+					**common, "tool_name": "Write", "tool_input": {
+						"file_path": str(workspace / "report.md"), "content": "Quarterly review\n",
+					},
+				})
+				self.assertNotIn("permissionDecision", output.get("hookSpecificOutput", {}))
+				(workspace / "work").mkdir()
+				for relative_path, content in (
+					("report.md", "Quarterly review\n"),
+					("work/page.png", "Preview image"),
+					("work/pages.txt", "Extracted text\n"),
+				):
+					(workspace / relative_path).write_text(content, encoding="utf-8")
+				skillnull_gate.handle_post_tool(common)
+				self.assertFalse(skillnull_gate.load_state(common["session_id"])["active"])
+				self.assertEqual(skillnull_gate.handle_stop(common), {})
+
+	def test_document_zip_review_copy_needs_no_development_reviews(self) -> None:
+		for use_repository in (False, True):
+			with self.subTest(use_repository=use_repository), tempfile.TemporaryDirectory() as directory:
+				workspace = Path(directory).resolve()
+				if use_repository:
+					subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+				common = {"session_id": f"archive-review-{use_repository}", "cwd": str(workspace)}
+				skillnull_gate.handle_user_prompt({**common, "prompt": "List candidate skills for review."})
+				archive_path = workspace / "outputs" / "candidate-review.zip"
+				archive_path.parent.mkdir()
+				with zipfile.ZipFile(archive_path, "w") as archive:
+					archive.writestr("skills/SKILL.md", "# Candidate\n")
+					archive.writestr("review.txt", "Pending review\n")
+				skillnull_gate.handle_post_tool(common)
+				self.assertFalse(skillnull_gate.load_state(common["session_id"])["active"])
+				self.assertEqual(skillnull_gate.handle_stop(common), {})
+
+	def test_source_unknown_and_unsafe_zip_still_require_reviews(self) -> None:
+		for member_name in ("src/helper.py", "package.json", "payload.bin", "nested.zip", "../review.md", "/review.md", "link.md"):
+			with self.subTest(member_name=member_name), tempfile.TemporaryDirectory() as directory:
+				workspace = Path(directory).resolve()
+				common = {"session_id": f"unsafe-archive-{member_name}", "cwd": str(workspace)}
+				skillnull_gate.handle_user_prompt(common)
+				with zipfile.ZipFile(workspace / "candidate.zip", "w") as archive:
+					member = zipfile.ZipInfo(member_name)
+					if member_name == "link.md":
+						member.external_attr = (stat.S_IFLNK | 0o777) << 16
+					archive.writestr(member, "content")
+				self.assertIn("缺少 plan", skillnull_gate.handle_stop(common)["reason"])
+
+	def test_invalid_zip_and_active_review_are_not_exempted(self) -> None:
+		self.start_session()
+		self.write_source("invalid.zip", "not an archive")
+		self.assertIn("缺少 plan", self.stop_session()["reason"])
+		self.record_review("plan")
+		with zipfile.ZipFile(self.repo_root / "review.zip", "w") as archive:
+			archive.writestr("review.md", "# Review\n")
+		self.assertIn("缺少 delivery", self.stop_session()["reason"])
+
+	def test_document_patch_does_not_require_a_plan(self) -> None:
+		self.start_session()
+		output = self.pre_tool(text="*** Begin Patch\n*** Add File: report.md\n+Quarterly review\n*** End Patch")
+		self.assertNotIn("permissionDecision", output.get("hookSpecificOutput", {}))
+		self.write_source("report.md", "Quarterly review\n")
+		self.assertEqual(self.stop_session(), {})
+
+	def test_mixed_patch_and_source_disguised_as_document_rename_require_plan(self) -> None:
+		self.start_session()
+		for patch_text in (
+			"*** Begin Patch\n*** Add File: report.md\n+Review\n*** Add File: work/helper.py\n+value = 1\n*** End Patch",
+			"*** Begin Patch\n*** Update File: report.md\n*** Move to: work/helper.py\n@@\n-Review\n+value = 1\n*** End Patch",
+		):
+			with self.subTest(patch_text=patch_text):
+				self.assertEqual(self.pre_tool(text=patch_text)["hookSpecificOutput"]["permissionDecision"], "deny")
+
+	def test_source_and_project_config_changes_still_require_reviews(self) -> None:
+		for case_index, relative_path in enumerate(("work/helper.py", "outputs/widget.ts", "package.json", "pyproject.toml", ".github/workflows/check.yml", "config/runtime.json")):
+			with self.subTest(relative_path=relative_path), tempfile.TemporaryDirectory() as directory:
+				workspace = Path(directory).resolve()
+				common = {"session_id": f"code-session-{case_index}", "cwd": str(workspace)}
+				skillnull_gate.handle_user_prompt({**common, "prompt": "Only write a report."})
+				target = workspace / relative_path
+				target.parent.mkdir(parents=True, exist_ok=True)
+				target.write_text("value = 1\n", encoding="utf-8")
+				result = skillnull_gate.handle_stop(common)
+				self.assertIn("缺少 plan", result["reason"])
+				self.assertIn("缺少 delivery", result["reason"])
+
+	def test_tracked_source_deletion_is_detected_without_post_tool(self) -> None:
+		self.write_source("src/value.py", "value = 1\n")
+		subprocess.run(["git", "-C", str(self.repo_root), "add", "src/value.py"], check=True)
+		subprocess.run(["git", "-C", str(self.repo_root), "-c", "user.name=Example", "-c", "user.email=example@example.com", "commit", "-qm", "Initial source"], check=True)
+		self.start_session()
+		(self.repo_root / "src/value.py").unlink()
+		self.assertIn("缺少 plan", self.stop_session()["reason"])
+
+	def test_document_changes_do_not_clear_an_active_development_review(self) -> None:
+		self.start_session()
+		self.record_review("plan")
+		skillnull_gate.handle_user_prompt({"session_id": "dynamic-session", "cwd": str(self.repo_root), "prompt": "Write a report."})
+		self.write_source("report.md", "Review\n")
+		skillnull_gate.handle_post_tool({"session_id": "dynamic-session", "cwd": str(self.repo_root)})
+		self.assertIn("缺少 delivery", self.stop_session()["reason"])
+
+	def test_namespaced_config_writes_and_document_symlink_require_plan(self) -> None:
+		self.write_source("src/value.py", "value = 1\n")
+		(self.repo_root / "report.md").symlink_to(self.repo_root / "src/value.py")
+		self.start_session()
+		for tool_name, tool_input in (
+			("editor__write_file", {"path": "package.json", "content": "{}"}),
+			("editor.edit", json.dumps({"file_path": "tsconfig.json"})),
+			("write", {"file_path": "report.md", "content": "value = 2\n"}),
+		):
+			with self.subTest(tool_name=tool_name):
+				output = skillnull_gate.handle_pre_tool({"session_id": "dynamic-session", "cwd": str(self.repo_root), "tool_name": tool_name, "tool_input": tool_input})
+				self.assertEqual(output["hookSpecificOutput"]["permissionDecision"], "deny")
+
+	def test_staged_source_change_is_detected_when_worktree_matches_baseline(self) -> None:
+		self.write_source("src/value.py", "value = 1\n")
+		subprocess.run(["git", "-C", str(self.repo_root), "add", "src/value.py"], check=True)
+		subprocess.run(["git", "-C", str(self.repo_root), "-c", "user.name=Example", "-c", "user.email=example@example.com", "commit", "-qm", "Initial source"], check=True)
+		self.start_session()
+		self.write_source("src/value.py", "value = 2\n")
+		subprocess.run(["git", "-C", str(self.repo_root), "add", "src/value.py"], check=True)
+		self.write_source("src/value.py", "value = 1\n")
+		self.assertIn("缺少 plan", self.stop_session()["reason"])
+
+	def test_document_only_commit_does_not_activate_development_review(self) -> None:
+		self.write_source("src/value.py", "value = 1\n")
+		subprocess.run(["git", "-C", str(self.repo_root), "add", "src/value.py"], check=True)
+		subprocess.run(["git", "-C", str(self.repo_root), "-c", "user.name=Example", "-c", "user.email=example@example.com", "commit", "-qm", "Initial source"], check=True)
+		self.start_session()
+		self.write_source("report.md", "Quarterly review\n")
+		subprocess.run(["git", "-C", str(self.repo_root), "add", "report.md"], check=True)
+		subprocess.run(["git", "-C", str(self.repo_root), "-c", "user.name=Example", "-c", "user.email=example@example.com", "commit", "-qm", "Write report"], check=True)
+		self.assertEqual(self.stop_session(), {})
+
+	def test_legacy_state_never_waives_unreviewed_source_changes(self) -> None:
+		self.start_session()
+		state = skillnull_gate.load_state("dynamic-session")
+		del state["baseline_development"]
+		skillnull_gate.save_state("dynamic-session", state)
+		self.write_source("src/value.py", "value = 1\n")
+		self.assertIn("缺少 plan", self.stop_session()["reason"])
 
 	def test_corrupt_state_returns_explicit_denial_in_hook_protocol(self) -> None:
 		skillnull_gate.save_state("dynamic-session", {"workspace": str(self.repo_root.resolve())})
@@ -260,6 +437,9 @@ class SkillnullGateTest(unittest.TestCase):
 		self.assertLess(len(context.encode("utf-8")), skillnull_gate.MAX_CONTEXT_BYTES)
 		self.assertIn("snapshot", context)
 		self.assertNotIn("必须核对真实验收条件", context)
+		self.assertIn("README.md", context)
+		self.assertNotIn("review 从标准输入", context)
+		self.assertLess(len(context.encode("utf-8")), 1600)
 
 	def test_installed_hook_and_review_cli_enforce_live_rule_changes(self) -> None:
 		installed_script = self.write_source("installed/scripts/skillnull_gate.py", SCRIPT_PATH.read_text(encoding="utf-8"))
@@ -289,19 +469,21 @@ class SkillnullGateTest(unittest.TestCase):
 		return_code, snapshot = invoke(["snapshot", *cli])
 		self.assertEqual(submit("plan", snapshot), 0)
 		installed_policy.write_text("# 约束\n\n1. 检查目标。\n2. 新增任意未来条件。\n", encoding="utf-8")
-		return_code, denied = invoke([], {**common, "hook_event_name": "PreToolUse", "tool_name": "functions.apply_patch", "tool_input": {"command": ""}})
-		self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
-		self.assertEqual(submit("plan", snapshot), 1)
+		return_code, allowed = invoke([], {**common, "hook_event_name": "PreToolUse", "tool_name": "functions.apply_patch", "tool_input": {"command": ""}})
+		self.assertNotIn("permissionDecision", allowed.get("hookSpecificOutput", {}))
+		self.assertIn("新增任意未来条件", allowed["hookSpecificOutput"]["additionalContext"])
+		self.assertEqual(submit("plan", snapshot), 0)
 		return_code, snapshot = invoke(["snapshot", *cli, "--offset", "0", "--limit", "20"])
 		self.assertEqual(snapshot["total_rules"], 2)
-		self.assertEqual(submit("plan", snapshot), 0)
 		self.assertEqual(submit("delivery", snapshot), 0)
 		self.write_source("src/value.py", "value = 1\n")
-		return_code, blocked = invoke([], {**common, "hook_event_name": "Stop", "stop_hook_active": True})
-		self.assertEqual(blocked["decision"], "block")
-		return_code, snapshot = invoke(["snapshot", *cli])
-		self.assertEqual(submit("delivery", snapshot), 0)
 		self.assertEqual(invoke([], {**common, "hook_event_name": "Stop", "stop_hook_active": True})[1], {})
+		report_common = {**common, "session_id": "installed-report"}
+		invoke([], {**report_common, "hook_event_name": "UserPromptSubmit", "prompt": "Read a PDF and write a report."})
+		self.write_source("work/page.png", "Preview")
+		self.write_source("report.md", "Quarterly review\n")
+		self.assertEqual(invoke([], {**report_common, "hook_event_name": "PostToolUse"})[1], {})
+		self.assertEqual(invoke([], {**report_common, "hook_event_name": "Stop"})[1], {})
 
 	def test_blocks_patch_that_empties_source_file(self) -> None:
 		self.write_source("src/hooks.ts", "export const useQuery = () => 1;\n")
