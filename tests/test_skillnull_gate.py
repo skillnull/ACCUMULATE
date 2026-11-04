@@ -426,6 +426,80 @@ class SkillnullGateTest(unittest.TestCase):
 			with self.subTest(command=command):
 				self.assertEqual(skillnull_gate.is_read_only_tool({"tool_name": "Bash", "tool_input": {"command": command}}), allowed)
 
+	def test_route_entry_does_not_match_unrelated_pagehide_text(self) -> None:
+		entry = self.write_source("src/example-preview/page.tsx", "export default function Preview() { return null; }\n")
+		self.write_source("notes.md", "The pagehide event needs separate handling.\n")
+		self.assertEqual(skillnull_gate.find_references(self.repo_root, entry, entry.read_text()), [])
+		self.write_source("src/routes.ts", 'import Preview from "./example-preview/page";\n')
+		self.assertTrue(skillnull_gate.find_references(self.repo_root, entry, entry.read_text()))
+
+	def invoke_hook(self, event: str, **extra: object) -> dict:
+		payload = {
+			"hook_event_name": event, "session_id": "dynamic-session",
+			"cwd": str(self.repo_root), **extra,
+		}
+		with (
+			mock.patch.object(sys, "argv", [str(SCRIPT_PATH)]),
+			mock.patch.object(sys, "stdin", io.StringIO(json.dumps(payload))),
+			mock.patch.object(skillnull_gate, "emit") as emit,
+		):
+			self.assertEqual(skillnull_gate.main(), 0)
+			return emit.call_args.args[0]
+
+	def test_missing_and_empty_policy_can_be_restored_without_unlocking_other_edits(self) -> None:
+		self.start_session()
+		self.policy_path.write_text("[参考](references/example.md)\n", encoding="utf-8")
+		reference = self.policy_path.parent / "references/example.md"
+		for empty in (False, True):
+			with self.subTest(empty=empty):
+				if empty:
+					reference.parent.mkdir(exist_ok=True)
+					reference.write_text("", encoding="utf-8")
+				operation = "Update" if empty else "Add"
+				repair = f"*** Begin Patch\n*** {operation} File: {reference}\n+# Restored reference\n*** End Patch"
+				output = self.invoke_hook("PreToolUse", tool_name="functions.apply_patch", tool_input={"input": repair})
+				self.assertNotIn("permissionDecision", output["hookSpecificOutput"])
+				for rejected in (
+					repair.replace(str(reference), str(self.repo_root / "src/example.ts")),
+					repair.replace("*** End Patch", f"*** Add File: {self.repo_root / 'src/example.ts'}\n+code\n*** End Patch"),
+					repair.replace("+# Restored reference", "+   "),
+					repair.replace(f"*** {operation} File: {reference}", f"*** Delete File: {reference}"),
+					repair.replace("+# Restored reference", f"*** Move to: {self.repo_root / 'src/example.ts'}\n+# Restored reference"),
+				):
+					denied = self.invoke_hook("PreToolUse", tool_name="apply_patch", tool_input={"input": rejected})
+					self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+			reference.parent.mkdir(exist_ok=True)
+			reference.write_text("# Restored reference\n\nCheck the actual result.\n", encoding="utf-8")
+			unreviewed = self.invoke_hook("PreToolUse", tool_name="apply_patch", tool_input={"input": f"*** Begin Patch\n*** Add File: {self.repo_root / 'src/example.ts'}\n+export const value = 1;\n*** End Patch"})
+			self.assertEqual(unreviewed["hookSpecificOutput"]["permissionDecision"], "deny")
+			self.assertIn("开发前审查", unreviewed["hookSpecificOutput"]["permissionDecisionReason"])
+			reference.unlink()
+
+	def test_internal_stop_fault_is_reported_once_without_losing_the_audit(self) -> None:
+		self.start_session()
+		self.record_review("plan")
+		before = skillnull_gate.load_state("dynamic-session")
+		self.policy_path.write_text("[参考](missing.md)\n", encoding="utf-8")
+		first = self.invoke_hook("Stop")
+		self.assertNotIn("decision", first)
+		self.assertIn("missing.md", first["systemMessage"])
+		self.assertEqual(self.invoke_hook("Stop"), {})
+		self.assertEqual(skillnull_gate.load_state("dynamic-session"), before)
+		self.write_source("policy/missing.md", "# Reference\n\nCheck the output.\n")
+		self.invoke_hook("PreToolUse", tool_name="Bash", tool_input={"cmd": "pwd"})
+		self.assertFalse(skillnull_gate.state_path("dynamic-session-gate-fault").exists())
+		(self.policy_path.parent / "missing.md").unlink()
+		self.assertIn("systemMessage", self.invoke_hook("Stop"))
+
+	def test_broken_session_stop_also_does_not_restart_forever(self) -> None:
+		self.start_session()
+		state = skillnull_gate.load_state("dynamic-session")
+		state["workspace"] = str(self.repo_root / "another-workspace")
+		skillnull_gate.save_state("dynamic-session", state)
+		self.assertIn("systemMessage", self.invoke_hook("Stop"))
+		self.assertEqual(self.invoke_hook("Stop"), {})
+		self.assertEqual(skillnull_gate.load_state("dynamic-session"), state)
+
 	def test_snapshot_preserves_prohibition_context_in_headings(self) -> None:
 		self.policy_path.write_text("# 约束\n\n## 已排除的方向\n\n- 用替代字体掩盖问题。\n", encoding="utf-8")
 		rule = skillnull_gate.load_rule_bundle()["rules"][0]

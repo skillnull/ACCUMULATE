@@ -274,6 +274,15 @@ def markdown_blocks(content: str) -> list[tuple[int, str]]:
 	return blocks
 
 
+class RuleSourceError(ValueError):
+	"""Identify one missing or empty policy source for narrowly scoped recovery."""
+
+	def __init__(self, path: Path, problem: str) -> None:
+		self.path = path.resolve()
+		relative_path = self.path.relative_to(SKILL_PATH.resolve().parent)
+		super().__init__(f"规则文件{problem}：{relative_path}")
+
+
 def load_rule_bundle() -> dict[str, Any]:
 	"""Discover the current policy graph from the installation, never the project."""
 	root = SKILL_PATH.resolve().parent
@@ -292,9 +301,12 @@ def load_rule_bundle() -> dict[str, Any]:
 			raise ValueError("规则引用必须指向 Markdown 文件")
 		if relative_path in sources:
 			continue
-		content = target.read_text(encoding="utf-8")
+		try:
+			content = target.read_text(encoding="utf-8")
+		except FileNotFoundError as error:
+			raise RuleSourceError(target, "缺失") from error
 		if not content.strip():
-			raise ValueError("规则文件为空")
+			raise RuleSourceError(target, "为空")
 		sources[relative_path] = content
 		headings: list[tuple[int, str]] = []
 		sections: dict[int, list[str]] = {}
@@ -556,6 +568,44 @@ def is_read_only_tool(payload: dict[str, Any]) -> bool:
 	} and not any(argument.startswith(("--output", "--ext-diff", "--textconv")) for argument in arguments)
 
 
+def is_rule_source_repair(payload: dict[str, Any], error: Exception) -> bool:
+	"""Only allow an explicit patch restoring the exact invalid Markdown source."""
+	if not isinstance(error, RuleSourceError):
+		return False
+	tool_name = str(payload.get("tool_name") or "").lower()
+	if "apply_patch" not in tool_name:
+		return False
+	patch_text = extract_tool_text(payload)
+	if "*** Move to:" in patch_text:
+		return False
+	sections = parse_patch_sections(patch_text)
+	if len(sections) != 1:
+		return False
+	section = sections[0]
+	target = Path(section["target"])
+	if not target.is_absolute():
+		target = payload_workspace(payload) / target
+	return (
+		target.resolve() == error.path
+		and section["operation"] in {"add", "update"}
+		and bool("\n".join(section["added"]).strip())
+	)
+
+
+def stop_error_notice(payload: dict[str, Any], reason: str) -> dict[str, Any]:
+	"""Preserve the audit and report a hook fault once without restarting Stop."""
+	fault_session = str(payload.get("session_id") or "unknown-session") + "-gate-fault"
+	fingerprint = hashlib.sha256(reason.encode("utf-8")).hexdigest()
+	try:
+		previous = load_state(fault_session)
+		if previous.get("fingerprint") == fingerprint:
+			return {}
+		save_state(fault_session, {"fingerprint": fingerprint})
+	except (OSError, ValueError, TypeError):
+		pass
+	return {"systemMessage": reason + "。校验未完成，保留审查状态；修复后重新验证，不自动重复唤醒。"}
+
+
 def extract_prompt(payload: dict[str, Any]) -> str:
 	for key in ("prompt", "user_prompt", "message"):
 		value = payload.get(key)
@@ -688,7 +738,8 @@ def exported_names(content: str) -> set[str]:
 
 def reference_tokens(target: Path, content: str) -> set[str]:
 	tokens = exported_names(content)
-	component_name = target.parent.name if target.stem == "index" else target.stem
+	entry_names = {"index", "page", "layout", "route", "loading", "error", "not-found"}
+	component_name = target.parent.name if target.stem in entry_names else target.stem
 	if len(component_name) >= 4:
 		tokens.add(component_name)
 	return {token for token in tokens if len(token) >= 4}
@@ -696,6 +747,7 @@ def reference_tokens(target: Path, content: str) -> set[str]:
 
 def find_references(repo_root: Path, target: Path, content: str) -> list[str]:
 	repo_root = repo_root.resolve()
+	target = target.resolve()
 	tokens = reference_tokens(target, content)
 	if not tokens:
 		return []
@@ -1075,16 +1127,24 @@ def main() -> int:
 	}
 	handler = handlers.get(event_name)
 	try:
-		emit(handler(payload) if handler else {})
+		output = handler(payload) if handler else {}
+		try:
+			clear_state(str(payload.get("session_id") or "unknown-session") + "-gate-fault")
+		except OSError:
+			pass
+		emit(output)
 	except (OSError, ValueError, TypeError) as error:
-		reason = "SKILLNULL 门禁校验失败：" + error.__class__.__name__
+		detail = str(error) if isinstance(error, RuleSourceError) else error.__class__.__name__
+		reason = "SKILLNULL 门禁校验失败：" + detail
 		if event_name == "PreToolUse":
 			if is_read_only_tool(payload):
 				emit(context_output(event_name, reason + "。仅允许只读诊断，请先恢复规则或状态。"))
+			elif is_rule_source_repair(payload, error):
+				emit(context_output(event_name, reason + "。仅放行对该失效规则文件的恢复；其余修改继续阻断。"))
 			else:
 				emit(deny_pretool(reason + "。恢复规则或状态后重试；本次工具尚未执行。"))
 		elif event_name == "Stop":
-			emit({"decision": "block", "reason": reason})
+			emit(stop_error_notice(payload, reason))
 		else:
 			emit(context_output(event_name, reason))
 	return 0
