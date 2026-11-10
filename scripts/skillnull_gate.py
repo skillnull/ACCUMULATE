@@ -73,7 +73,7 @@ STATIC_RESOURCE_PATTERNS = (
 	),
 	(
 		re.compile(
-			r"(?P<kind>url)\(\s*(?P<quote>[\"']?)"
+			r"(?<![\w-])(?P<kind>url)\(\s*(?P<quote>[\"']?)"
 			r"(?P<value>.*?)(?P=quote)\s*\)",
 			re.IGNORECASE | re.DOTALL,
 		),
@@ -90,6 +90,25 @@ REMOVAL_DENIAL_WORDS = re.compile(
 	r"|(?:do\s+not|don't|must\s+not|without)\s+"
 	r"(?:remove|delete|deprecate|rewrite|replace)",
 	re.IGNORECASE,
+)
+FAILURE_FEEDBACK = re.compile(
+	r"还是不行|仍(?:然)?(?:失败|不行|未(?:解决|生效|触发)|没(?:有)?(?:好|修好|解决))"
+	r"|还(?:是)?没(?:有)?(?:好|修好|解决|生效|触发)|又(?:失败|复发|出现了同样的问题)"
+	r"|\b(?:still (?:fails?|broken|not working)|failed again)\b",
+	re.IGNORECASE,
+)
+REPEATED_FAILURE = re.compile(
+	r"(?:第二次|第2次|两次|二次|2次|反复|多次).{0,50}"
+	r"(?:未好|没好|未解决|没解决|未修好|没修好|没触发|未触发|不行|失败|复发|仍|还是)"
+	r"|(?:修|改|尝试).{0,12}(?:两次|二次|2次).{0,50}(?:仍|还|失败|不行)"
+	r"|反复(?:出现|复发)"
+	r"|\b(?:second|twice|repeatedly)\b.{0,60}\b(?:fail\w*|broken|not working|still)\b",
+	re.IGNORECASE,
+)
+INVESTIGATION_SOURCE = "rules/repeated-issue-deep-investigation.md"
+INVESTIGATION_FIELDS = (
+	"acceptance", "previous_attempts", "reproduction", "hypotheses",
+	"root_cause", "validation_plan",
 )
 IMPORT_PATTERN = re.compile(
 	r"\bimport\s+(?:type\s+)?(.+?)\s+from\s+[\"'][^\"']+[\"']\s*;?",
@@ -349,7 +368,10 @@ def load_rule_bundle() -> dict[str, Any]:
 	return {
 		"revision": fingerprint,  # Digest of every discovered rule source.
 		"sources": sources,  # Complete current Markdown, keyed by relative path.
-		"rules": rules,  # Review units discovered without fixed numbers or counts.
+		"rules": [rule for rule in rules if not rule["source"].startswith("references/")],
+		# Mandatory review units; engineering references are consulted as needed.
+		"references": [source for source in sources if source.startswith("references/")],
+		# Optional reference paths, kept out of mandatory model context and reviews.
 	}
 
 
@@ -358,6 +380,7 @@ def load_skill_context(bundle: dict[str, Any] | None = None) -> str:
 	return "\n\n".join(
 		f"--- SKILLNULL 来源：{relative_path} ---\n\n{content}"
 		for relative_path, content in bundle["sources"].items()
+		if relative_path not in bundle["references"]
 	)
 
 
@@ -545,9 +568,108 @@ def review_instructions(session_id: str, workspace: Path) -> str:
 	)
 
 
+def review_coverage_failures(review: dict[str, Any], rules: list[dict[str, Any]]) -> list[str]:
+	"""Check new submissions against their complete source; keep accepted audits."""
+	required = {rule["id"] for rule in rules}
+	submitted = {entry["id"] for entry in review["entries"]}
+	failures = []
+	if required - submitted:
+		failures.append(f"逐条审查遗漏 {len(required - submitted)} 条规则")
+	if submitted - required:
+		failures.append("逐条审查含未知规则")
+	return failures
+
+
+def repeat_state(session_id: str, workspace: Path) -> dict[str, Any]:
+	"""Keep only counters across turns, never the original prompt or evidence."""
+	state = load_state(session_id + "-repeat")
+	if not state:
+		return {"workspace": str(workspace), "failures": 0, "generation": 0}
+	if state.get("workspace") != str(workspace) or any(
+		type(state.get(field)) is not int or state[field] < 0
+		for field in ("failures", "generation")
+	):
+		raise ValueError("重复问题状态损坏")
+	if "investigated_generation" in state and (
+		type(state["investigated_generation"]) is not int
+		or not 0 <= state["investigated_generation"] <= state["generation"]
+	):
+		raise ValueError("深查代次损坏")
+	return state
+
+
+def investigation_failures(state: dict[str, Any]) -> list[str]:
+	repeated = state.get("repeat_issue", {})
+	if repeated.get("failures", 0) < 2:
+		return []
+	review = state.get("investigation", {})
+	if not isinstance(review, dict):
+		raise ValueError("深查审查状态损坏")
+	if max(review.get("generation", -1), repeated.get("investigated_generation", -1)) != repeated.get("generation"):
+		return ["重复问题已触发强制深查，须先提交本次根因与复现证据"]
+	return []
+
+
+def investigation_delivery_failures(state: dict[str, Any], bundle: dict[str, Any]) -> list[str]:
+	"""Permit an evidenced incomplete report without permitting another repair."""
+	failures = investigation_failures(state)
+	review = state.get("delivery", {})
+	if not failures or not isinstance(review, dict) or review.get("outcome") != "incomplete":
+		return failures
+	if review_failures(review, bundle, "delivery", ""):
+		return failures
+	required = {rule["id"] for rule in bundle["rules"] if rule["source"] == INVESTIGATION_SOURCE}
+	blocked = {entry["id"] for entry in review["entries"] if entry.get("status") == "blocked"}
+	return [] if required and required <= blocked else failures
+
+
+def is_gate_cli(payload: dict[str, Any]) -> bool:
+	"""Allow the gate's own snapshot/review command while repairs are paused."""
+	tool_action = str(payload.get("tool_name") or "").lower().rsplit("__", 1)[-1].rsplit(".", 1)[-1]
+	if tool_action not in {"bash", "exec_command"}:
+		return False
+	command = extract_tool_text(payload)
+	heredoc = re.fullmatch(r"([^\n]+?)\s+<<'([A-Z_]+)'\n(.*)\n\2\s*", command, re.DOTALL)
+	if heredoc:
+		try:
+			if not isinstance(json.loads(heredoc.group(3)), dict):
+				return False
+		except ValueError:
+			return False
+		command = heredoc.group(1)
+	try:
+		arguments = shlex.split(command)
+	except ValueError:
+		return False
+	return (
+		len(arguments) >= 3 and Path(arguments[0]).name.startswith("python")
+		and Path(arguments[1]).resolve() == Path(__file__).resolve()
+		and arguments[2] in {"snapshot", "review"}
+		and not any(re.search(r"[;&|<>`$\n]", argument) for argument in arguments)
+	)
+
+
+def unwrap_shell_tool(payload: dict[str, Any]) -> dict[str, Any]:
+	"""Recognize one literal shell call without evaluating wrapper JavaScript."""
+	if str(payload.get("tool_name") or "").lower().rsplit(".", 1)[-1] != "exec":
+		return payload
+	match = re.fullmatch(
+		r"\s*text\(await tools\.exec_command\((.*)\)\);?\s*",
+		extract_tool_text(payload), re.DOTALL,
+	)
+	if match:
+		try:
+			arguments = json.loads(match.group(1))
+		except ValueError:
+			return payload
+		if isinstance(arguments, dict):
+			return {**payload, "tool_name": "exec_command", "tool_input": arguments}
+	return payload
+
+
 def is_read_only_tool(payload: dict[str, Any]) -> bool:
 	"""Retain a narrow diagnostic path when policy or state cannot be loaded."""
-	tool_name = str(payload.get("tool_name") or "").lower()
+	tool_name = str(payload.get("tool_name") or "").lower().rsplit("__", 1)[-1].rsplit(".", 1)[-1]
 	if tool_name in {"read", "read_file", "list_directory", "glob", "grep"}:
 		return True
 	if tool_name not in {"bash", "exec_command"}:
@@ -923,7 +1045,9 @@ def session_state(session_id: str, workspace: Path) -> dict[str, Any]:
 			state["baseline_development"] = development_revision(workspace)
 		if not isinstance(state["baseline_development"], str):
 			raise ValueError("开发文件基线损坏")
-	return state or initial_state(workspace)
+	state = state or initial_state(workspace)
+	state["repeat_issue"] = repeat_state(session_id, workspace)
+	return state
 
 
 def rule_context(
@@ -966,11 +1090,27 @@ def handle_user_prompt(payload: dict[str, Any]) -> dict[str, Any]:
 		state["removal_authorized"] = True
 	bundle = load_rule_bundle()
 	context = rule_context(state, bundle, session_id, workspace, force=True)
+	# Restoration events may carry the last prompt; count only a new submission.
+	if payload.get("hook_event_name") == "UserPromptSubmit":
+		repeated = state["repeat_issue"]
+		feedback = re.sub(r"```.*?```|`[^`]*`|“[^”]*”|「[^」]*」|\"[^\"\n]*\"", "", prompt, flags=re.DOTALL)
+		if REPEATED_FAILURE.search(feedback) or FAILURE_FEEDBACK.search(feedback):
+			repeated["failures"] = max(
+				repeated["failures"] + 1, 2 if REPEATED_FAILURE.search(feedback) else 1
+			)
+			repeated["generation"] += 1
+			save_state(session_id + "-repeat", repeated)
+	if investigation_failures(state):
+		context += (
+			"\n重复问题已触发强制深查：先读取 " + str(SKILL_PATH.resolve().parent / INVESTIGATION_SOURCE)
+			+ "，完成复现与根因验证后提交 phase=investigation 审查，再继续修复。"
+		)
 	save_state(session_id, state)
 	return context_output(str(payload.get("hook_event_name") or "UserPromptSubmit"), context)
 
 
 def handle_pre_tool(payload: dict[str, Any]) -> dict[str, Any]:
+	payload = unwrap_shell_tool(payload)
 	repo_root = payload_workspace(payload)
 	session_id = str(payload.get("session_id") or "unknown-session")
 	state = session_state(session_id, repo_root)
@@ -981,6 +1121,14 @@ def handle_pre_tool(payload: dict[str, Any]) -> dict[str, Any]:
 	is_patch = "apply_patch" in tool_name
 	tool_action = tool_name.rsplit("__", 1)[-1].rsplit(".", 1)[-1]
 	is_edit = is_patch or tool_action in {"edit", "write", "edit_file", "write_file"}
+	if investigation_failures(state) and (
+		is_edit or (tool_action in {"bash", "exec_command", "exec", "js", "write_stdin"}
+			and not is_read_only_tool(payload) and not is_gate_cli(payload))
+	):
+		save_state(session_id, state)
+		return deny_pretool("SKILLNULL：" + "；".join(investigation_failures(state))
+			+ "。只读诊断与门禁审查仍可执行；方法见 "
+			+ str(SKILL_PATH.resolve().parent / "README.md") + "。")
 	if is_edit and (state["active"] or edits_development_files(payload, tool_text)):
 		failures = review_failures(state.get("plan"), bundle, "plan", "")
 		if failures:
@@ -1035,6 +1183,7 @@ def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
 	bundle = load_rule_bundle()
 	revision = workspace_revision(repo_root)
 	failures: list[str] = []
+	failures.extend(investigation_delivery_failures(state, bundle))
 	if state["active"] or development_revision(repo_root) != state["baseline_development"]:
 		failures.extend(current_gate_failures(repo_root, state))
 		failures.extend(review_failures(state.get("plan"), bundle, "plan", revision))
@@ -1074,14 +1223,36 @@ def handle_review_cli() -> int:
 			"offset": options.offset,  # Start index of the current page.
 			"rules": bundle["rules"][options.offset:options.offset + options.limit],
 			# Dynamically discovered IDs and full requirements on the selected page.
+			"references": bundle["references"],  # Optional engineering reference paths.
 		})
 		return 0
 	review = json.load(sys.stdin)
 	phase = review.get("phase") if isinstance(review, dict) else None
-	if phase not in {"plan", "delivery"}:
-		raise ValueError("phase 必须是 plan 或 delivery")
+	if phase not in {"plan", "delivery", "investigation"}:
+		raise ValueError("phase 必须是 plan、delivery 或 investigation")
 	failures = review_failures(review, bundle, phase, revision)
+	if not failures and review != state.get(phase):
+		rules = bundle["rules"]
+		if phase == "investigation":
+			rules = [rule for rule in rules if rule["source"] == INVESTIGATION_SOURCE]
+			if not rules:
+				failures.append("缺少重复问题深查规则源")
+		failures.extend(review_coverage_failures(review, rules))
+	if phase == "investigation":
+		for field in INVESTIGATION_FIELDS:
+			if not isinstance(review.get(field), str) or not review[field].strip():
+				failures.append(f"深查缺少 {field} 证据")
+		if any(entry.get("status") != "verified" for entry in review.get("entries", []) if isinstance(entry, dict)):
+			failures.append("深查条目必须全部 verified，不得豁免")
+		evidence_hash = hashlib.sha256(json.dumps(
+			{field: review.get(field) for field in (*INVESTIGATION_FIELDS, "entries")},
+			ensure_ascii=False, sort_keys=True,
+		).encode("utf-8")).hexdigest()
+		repeated = state["repeat_issue"]
+		if repeated.get("evidence_hash") == evidence_hash and repeated.get("investigated_generation") != repeated["generation"]:
+			failures.append("新的失败须补充本次深查证据，不能沿用旧记录")
 	if phase == "delivery":
+		failures.extend(investigation_delivery_failures({**state, "delivery": review}, bundle))
 		failures.extend(review_failures(state.get("plan"), bundle, "plan", revision))
 		failures.extend(current_gate_failures(workspace, state))
 	if failures:
@@ -1090,6 +1261,11 @@ def handle_review_cli() -> int:
 			"failures": failures,  # Requirements preventing acceptance.
 		})
 		return 1
+	if phase == "investigation":
+		review["generation"] = state["repeat_issue"]["generation"]
+		state["repeat_issue"]["investigated_generation"] = review["generation"]
+		state["repeat_issue"]["evidence_hash"] = evidence_hash
+		save_state(options.session + "-repeat", state["repeat_issue"])
 	state[phase] = review
 	state["active"] = True
 	save_state(options.session, state)

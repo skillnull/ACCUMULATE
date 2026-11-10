@@ -115,6 +115,19 @@ class SkillnullGateTest(unittest.TestCase):
 		self.write_source("policy/rules/details.md", "必须核对另一个入口。\n")
 		self.assertNotEqual(previous_revision, skillnull_gate.load_rule_bundle()["revision"])
 
+	def test_engineering_references_are_optional_but_specialized_rules_are_required(self) -> None:
+		self.policy_path.write_text("# Policy\n\n[Rule](rules/details.md)\n\n[Reference](references/example.md)\n", encoding="utf-8")
+		self.write_source("policy/rules/details.md", "# Rule\n\nRequired condition.\n")
+		self.write_source("policy/references/example.md", "# Reference\n\nOptional implementation example.\n")
+		bundle = skillnull_gate.load_rule_bundle()
+		self.assertEqual(bundle["references"], ["references/example.md"])
+		self.assertIn("rules/details.md", {rule["source"] for rule in bundle["rules"]})
+		self.assertNotIn("references/example.md", {rule["source"] for rule in bundle["rules"]})
+		self.assertNotIn("Optional implementation example", skillnull_gate.load_skill_context(bundle))
+		self.start_session()
+		self.record_review("plan")
+		self.assertEqual(self.submit_review(skillnull_gate.load_state("dynamic-session")["plan"])[0], 0)
+
 	def test_local_extension_creation_and_deletion_are_live_changes(self) -> None:
 		self.start_session()
 		self.record_review("plan")
@@ -446,6 +459,132 @@ class SkillnullGateTest(unittest.TestCase):
 			self.assertEqual(skillnull_gate.main(), 0)
 			return emit.call_args.args[0]
 
+	def submit_review(self, review: dict) -> tuple[int, dict]:
+		with (
+			mock.patch.object(sys, "argv", [str(SCRIPT_PATH), "review", "--session", "dynamic-session", "--cwd", str(self.repo_root)]),
+			mock.patch.object(sys, "stdin", io.StringIO(json.dumps(review))),
+			mock.patch.object(skillnull_gate, "emit") as emit,
+		):
+			return_code = skillnull_gate.handle_review_cli()
+			return return_code, emit.call_args.args[0]
+
+	def prepare_investigation(self) -> dict:
+		self.policy_path.write_text("# Policy\n\n1. Check the task.\n\n[Deep investigation](rules/repeated-issue-deep-investigation.md)\n", encoding="utf-8")
+		self.write_source("policy/rules/repeated-issue-deep-investigation.md", "# Deep investigation\n\n1. Reproduce the failure.\n2. Verify the root cause.\n")
+		bundle = skillnull_gate.load_rule_bundle()
+		return {
+			"phase": "investigation",
+			"entries": [{"id": rule["id"], "status": "verified", "reason": "Isolated reproduction identifies the failing event handler.", "evidence": "The original event sequence reproduces the missing denial."}
+				for rule in bundle["rules"] if rule["source"] == skillnull_gate.INVESTIGATION_SOURCE],
+			"acceptance": "Second failure prevents another repair until investigation.",
+			"previous_attempts": "The earlier generic review did not inspect repeated failures.",
+			"reproduction": "Replay the original failed prompt and patch event.",
+			"hypotheses": "Rule loading works; the event handler has no repeated-failure state.",
+			"root_cause": "The handler only records deletion authorization.",
+			"validation_plan": "Replay prompt, denial, evidence submission and permitted patch.",
+		}
+
+	def test_new_review_cannot_omit_rules_or_invent_ids(self) -> None:
+		self.start_session()
+		self.record_review("plan")
+		original = skillnull_gate.load_state("dynamic-session")["plan"]
+		self.policy_path.write_text("# Policy\n\n1. Check input.\n2. Check output.\n", encoding="utf-8")
+		bundle = skillnull_gate.load_rule_bundle()
+		candidate = {"phase": "plan", "entries": [{**original["entries"][0], "id": bundle["rules"][0]["id"]}]}
+		self.assertIn("遗漏", str(self.submit_review(candidate)[1]))
+		candidate["entries"][0]["id"] = "invented-rule"
+		self.assertIn("未知规则", str(self.submit_review(candidate)[1]))
+		self.assertEqual(self.submit_review(original)[0], 0)
+
+	def test_explicit_second_failure_blocks_even_existing_delivery(self) -> None:
+		self.start_session()
+		self.record_review("plan")
+		self.record_review("delivery")
+		output = self.invoke_hook("UserPromptSubmit", prompt="这个问题你已经修了两次，原来的复现步骤仍然失败。继续修复。")
+		self.assertIn("强制深查", str(output))
+		patch = "*** Begin Patch\n*** Add File: src/retry.py\n+value = 1\n*** End Patch"
+		self.assertEqual(self.pre_tool(text=patch)["hookSpecificOutput"]["permissionDecision"], "deny")
+		self.assertIn("强制深查", self.stop_session(stop_hook_active=True)["reason"])
+		self.assertEqual(skillnull_gate.load_state("dynamic-session")["repeat_issue"]["failures"], 2)
+
+	def test_explicit_recurrence_triggers_but_quoted_examples_do_not(self) -> None:
+		self.start_session()
+		for prompt in ('解释“第二次仍未好”的含义。', 'Translate "still not working".', 'Example: ```text\n反复出现\n```'):
+			self.invoke_hook("UserPromptSubmit", prompt=prompt)
+			self.assertEqual(skillnull_gate.load_state("dynamic-session")["repeat_issue"]["failures"], 0)
+		self.invoke_hook("UserPromptSubmit", prompt="这个问题反复出现")
+		self.assertIn("强制深查", self.stop_session()["reason"])
+
+	def test_failure_count_survives_stop_and_restoration_without_storing_prompt(self) -> None:
+		self.start_session()
+		self.invoke_hook("UserPromptSubmit", prompt="还是不行")
+		self.assertEqual(self.stop_session(), {})
+		self.assertFalse(skillnull_gate.load_state("dynamic-session"))
+		for event in ("SessionStart", "PostCompact"):
+			self.invoke_hook(event, prompt="还是不行")
+			self.assertEqual(skillnull_gate.load_state("dynamic-session")["repeat_issue"]["failures"], 1)
+		self.invoke_hook("UserPromptSubmit", prompt="还是不行")
+		self.assertIn("强制深查", self.stop_session()["reason"])
+		ledger = skillnull_gate.load_state("dynamic-session-repeat")
+		self.assertEqual(ledger["failures"], 2)
+		self.assertNotIn("还是不行", json.dumps(ledger, ensure_ascii=False))
+
+	def test_blocked_investigation_can_report_incomplete_without_unlocking_repairs(self) -> None:
+		self.prepare_investigation()
+		self.start_session()
+		self.record_review("plan")
+		self.invoke_hook("UserPromptSubmit", prompt="第二次还是不行")
+		self.record_review("delivery")
+		review = skillnull_gate.load_state("dynamic-session")["delivery"]
+		self.assertEqual(self.submit_review(review)[0], 1)
+		review["outcome"] = "incomplete"
+		for entry in review["entries"]:
+			if entry["id"].startswith(skillnull_gate.INVESTIGATION_SOURCE + ":"):
+				entry.update(status="blocked", reason="The original device is unavailable.", evidence="Only the local reproduction is accessible; device verification is pending.")
+		self.assertEqual(self.submit_review(review)[0], 0)
+		self.assertEqual(self.pre_tool()["hookSpecificOutput"]["permissionDecision"], "deny")
+		self.assertEqual(self.stop_session(), {})
+		self.invoke_hook("SessionStart")
+		self.assertEqual(self.pre_tool()["hookSpecificOutput"]["permissionDecision"], "deny")
+
+	def test_investigation_requires_full_evidence_and_new_failure_invalidates_it(self) -> None:
+		review = self.prepare_investigation()
+		self.start_session()
+		self.record_review("plan")
+		self.invoke_hook("UserPromptSubmit", prompt="第二次还是不行")
+		for field in (*skillnull_gate.INVESTIGATION_FIELDS, "entries"):
+			with self.subTest(field=field):
+				candidate = {**review, field: [] if field == "entries" else ""}
+				self.assertEqual(self.submit_review(candidate)[0], 1)
+		candidate = {**review, "entries": [{**entry, "status": "not_applicable"} for entry in review["entries"]]}
+		self.assertEqual(self.submit_review(candidate)[0], 1)
+		self.assertEqual(self.submit_review(review)[0], 0)
+		self.assertNotIn("permissionDecision", self.pre_tool().get("hookSpecificOutput", {}))
+		self.record_review("delivery")
+		self.assertEqual(self.stop_session(), {})
+		self.invoke_hook("UserPromptSubmit", prompt="继续检查其他内容")
+		self.assertEqual(self.stop_session(), {})
+		self.invoke_hook("UserPromptSubmit", prompt="还是不行")
+		self.assertIn("强制深查", self.stop_session()["reason"])
+		self.assertEqual(self.submit_review(review)[0], 1)
+		review["reproduction"] += " The new failure is reproduced under the original conditions."
+		self.assertEqual(self.submit_review(review)[0], 0)
+
+	def test_pending_investigation_keeps_diagnostics_and_its_cli_available(self) -> None:
+		self.start_session()
+		self.invoke_hook("UserPromptSubmit", prompt="第二次还是不行")
+		for name, command in (("functions.exec_command", "rg handler scripts"), ("Bash", "cat SKILL.md"), ("functions.exec_command", f"{sys.executable} {SCRIPT_PATH} snapshot --session dynamic-session")):
+			with self.subTest(command=command):
+				self.assertNotIn("permissionDecision", self.pre_tool(name, command).get("hookSpecificOutput", {}))
+		command = f"{sys.executable} {SCRIPT_PATH} review --session dynamic-session <<'REVIEW'\n{{\"phase\":\"investigation\"}}\nREVIEW"
+		self.assertTrue(skillnull_gate.is_gate_cli({"tool_name": "exec_command", "tool_input": {"cmd": command}}))
+		for command in ("python3 -c 'open(\"src/retry.py\", \"w\").write(\"retry\")'", f"{sys.executable} {SCRIPT_PATH} snapshot; touch src/retry.py"):
+			self.assertEqual(self.pre_tool("functions.exec_command", command)["hookSpecificOutput"]["permissionDecision"], "deny")
+		for command, allowed in (("cat SKILL.md", True), ("touch src/retry.py", False)):
+			wrapper = "text(await tools.exec_command(" + json.dumps({"cmd": command}) + "));"
+			output = self.pre_tool("functions.exec", wrapper)
+			self.assertEqual(output.get("hookSpecificOutput", {}).get("permissionDecision") != "deny", allowed)
+
 	def test_missing_and_empty_policy_can_be_restored_without_unlocking_other_edits(self) -> None:
 		self.start_session()
 		self.policy_path.write_text("[参考](references/example.md)\n", encoding="utf-8")
@@ -558,6 +697,24 @@ class SkillnullGateTest(unittest.TestCase):
 		self.write_source("report.md", "Quarterly review\n")
 		self.assertEqual(invoke([], {**report_common, "hook_event_name": "PostToolUse"})[1], {})
 		self.assertEqual(invoke([], {**report_common, "hook_event_name": "Stop"})[1], {})
+
+		installed_policy.write_text("# Policy\n\n1. Check the task.\n\n[Investigation](rules/repeated-issue-deep-investigation.md)\n", encoding="utf-8")
+		self.write_source("installed/rules/repeated-issue-deep-investigation.md", "# Investigation\n\n1. Reproduce the original failure.\n2. Validate the cause.\n")
+		repeated_common = {**common, "session_id": "installed-repeat"}
+		repeated_cli = ["review", "--session", "installed-repeat", "--cwd", str(self.repo_root)]
+		output = invoke([], {**repeated_common, "hook_event_name": "UserPromptSubmit", "prompt": "这个问题你已经修了两次，原来的复现步骤仍然失败。继续修复。"})[1]
+		self.assertIn("强制深查", str(output))
+		patch_event = {**repeated_common, "hook_event_name": "PreToolUse", "tool_name": "functions.apply_patch", "tool_input": {"input": "*** Begin Patch\n*** Add File: src/retry.py\n+value = 1\n*** End Patch"}}
+		self.assertEqual(invoke([], patch_event)[1]["hookSpecificOutput"]["permissionDecision"], "deny")
+		self.assertEqual(invoke([], {**repeated_common, "hook_event_name": "Stop"})[1]["decision"], "block")
+		snapshot = invoke(["snapshot", "--session", "installed-repeat", "--cwd", str(self.repo_root), "--limit", "20"])[1]
+		entries = [{"id": rule["id"], "status": "verified", "reason": "Isolated event protocol regression.", "evidence": "The subprocess hook blocks the original repeated-failure event."} for rule in snapshot["rules"]]
+		self.assertEqual(invoke(repeated_cli, {"phase": "plan", "entries": [{**entry, "status": "planned"} for entry in entries]})[0], 0)
+		investigation = {"phase": "investigation", "entries": [entry for entry in entries if entry["id"].startswith(skillnull_gate.INVESTIGATION_SOURCE + ":")], **{field: "The subprocess replay identifies the missing repeated-failure transition." for field in skillnull_gate.INVESTIGATION_FIELDS}}
+		self.assertEqual(invoke(repeated_cli, investigation)[0], 0)
+		self.assertNotIn("permissionDecision", invoke([], patch_event)[1].get("hookSpecificOutput", {}))
+		self.assertEqual(invoke(repeated_cli, {"phase": "delivery", "entries": entries})[0], 0)
+		self.assertEqual(invoke([], {**repeated_common, "hook_event_name": "Stop"})[1], {})
 
 	def test_blocks_patch_that_empties_source_file(self) -> None:
 		self.write_source("src/hooks.ts", "export const useQuery = () => 1;\n")
@@ -697,6 +854,16 @@ class SkillnullGateTest(unittest.TestCase):
 		self.assertEqual(
 			skillnull_gate.static_resource_path_errors(self.repo_root),
 			["src/index.css:1 style url"],
+		)
+
+	def test_resource_scan_ignores_url_suffix_in_function_names(self) -> None:
+		self.write_source(
+			"src/editor.vue",
+			'<script>export default { methods: { '
+			'changeUrl(url, key) {}, buildURL(base, path) {} } }</script>\n',
+		)
+		self.assertEqual(
+			skillnull_gate.static_resource_path_errors(self.repo_root), []
 		)
 
 	def test_hook_output_is_valid_json(self) -> None:
