@@ -846,7 +846,7 @@ def removed_import_still_used(
 
 def exported_names(content: str) -> set[str]:
 	patterns = (
-		r"\bexport\s+(?:declare\s+)?(?:const|let|var|function|class|interface|type|enum)\s+([A-Za-z_$][\w$]*)",
+		r"\bexport\s+(?:default\s+)?(?:declare\s+)?(?:const|let|var|function|class|interface|type|enum)\s+([A-Za-z_$][\w$]*)",
 		r"\bexport\s*\{([^}]+)\}",
 	)
 	names = set(re.findall(patterns[0], content))
@@ -861,9 +861,14 @@ def exported_names(content: str) -> set[str]:
 def reference_tokens(target: Path, content: str) -> set[str]:
 	tokens = exported_names(content)
 	entry_names = {"index", "page", "layout", "route", "loading", "error", "not-found"}
-	component_name = target.parent.name if target.stem in entry_names else target.stem
-	if len(component_name) >= 4:
-		tokens.add(component_name)
+	file_names = {target.name, target.stem}
+	if target.suffix in {".ts", ".tsx"}:
+		file_names.add(f"{target.stem}.js")
+	if target.stem in entry_names:
+		tokens.add(target.parent.name)
+		tokens.update(f"{target.parent.name}/{name}" for name in file_names)
+	else:
+		tokens.update(file_names)
 	return {token for token in tokens if len(token) >= 4}
 
 
@@ -873,12 +878,24 @@ def find_references(repo_root: Path, target: Path, content: str) -> list[str]:
 	tokens = reference_tokens(target, content)
 	if not tokens:
 		return []
+	symbols = exported_names(content)
 	references: list[str] = []
 	for token in sorted(tokens):
+		escaped = re.escape(token)
+		if token in symbols:
+			pattern = re.compile(rf"(?<![\w$]){escaped}(?![\w$])")
+		else:
+			prefix = r"(?:[/\\]|[\"'`(])" if "/" in token or token in {target.name, f"{target.stem}.js"} else r"[/\\]"
+			pattern = re.compile(
+				rf"{prefix}{escaped}(?=$|[/\\\"'`?#\s)])"
+				rf"|\b(?:from|import)\s*(?:\(\s*)?[\"']{escaped}[\"']"
+				rf"|\brequire\s*\(\s*[\"']{escaped}[\"']"
+			)
 		result = subprocess.run(
 			[
 				"rg",
 				"-n",
+				"--null",
 				"--fixed-strings",
 				"--glob",
 				"!.git/**",
@@ -891,8 +908,16 @@ def find_references(repo_root: Path, target: Path, content: str) -> list[str]:
 			text=True,
 			check=False,
 		)
-		for line in result.stdout.splitlines()[:5]:
-			references.append(line.replace(str(repo_root) + os.sep, ""))
+		for line in result.stdout.splitlines():
+			source_path, separator, location = line.partition("\0")
+			if not separator or Path(source_path).resolve() == target:
+				continue
+			line_number, _separator, source_line = location.partition(":")
+			if pattern.search(source_line):
+				relative_path = os.path.relpath(source_path, repo_root)
+				references.append(f"{relative_path}:{line_number}:{source_line}")
+				if len(references) >= 5:
+					break
 		if references:
 			break
 	return references

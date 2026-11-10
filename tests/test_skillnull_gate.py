@@ -446,6 +446,32 @@ class SkillnullGateTest(unittest.TestCase):
 		self.write_source("src/routes.ts", 'import Preview from "./example-preview/page";\n')
 		self.assertTrue(skillnull_gate.find_references(self.repo_root, entry, entry.read_text()))
 
+	def test_stylesheet_stem_does_not_match_release_preview_prose(self) -> None:
+		stylesheet = self.write_source("src/example-preview/preview.less", ".example { color: red; }\n")
+		self.write_source("notes.md", "docs(release-preview): update release-previews/report.md\n")
+		self.write_source("src/other.ts", 'import "./my-preview.less";\n')
+		self.assertEqual(skillnull_gate.find_references(self.repo_root, stylesheet, stylesheet.read_text()), [])
+		patch = "*** Begin Patch\n*** Delete File: src/example-preview/preview.less\n*** End Patch"
+		self.assertIsNone(skillnull_gate.check_patch(self.repo_root, patch, True)[0])
+		self.assertIn("未得到", skillnull_gate.check_patch(self.repo_root, patch, False)[0])
+
+	def test_stylesheet_imports_and_resource_paths_remain_references(self) -> None:
+		stylesheet = self.write_source("src/preview.less", ".example { color: red; }\n")
+		for statement in ('import "./preview.less";', '@import "preview.less";', 'import("./preview");', 'require("@/ui/preview");', 'import "preview";', 'url(preview.less)'):
+			with self.subTest(statement=statement):
+				self.write_source("src/consumer.ts", statement + "\n")
+				self.assertTrue(skillnull_gate.find_references(self.repo_root, stylesheet, stylesheet.read_text()))
+
+	def test_route_entry_class_and_export_name_prefix_are_not_references(self) -> None:
+		entry = self.write_source("src/example-preview/page.tsx", "export default function Preview() { return null; }\n")
+		self.write_source("src/style.less", ".example-preview { color: red; }\n")
+		self.write_source("src/other.ts", "const PreviewPage = 1;\n")
+		self.assertEqual(skillnull_gate.find_references(self.repo_root, entry, entry.read_text()), [])
+		for statement in ('import View from "./example-preview/page";', 'import View from "./example-preview/page.js";', '<a href="/example-preview">Open</a>', 'Preview();'):
+			with self.subTest(statement=statement):
+				self.write_source("src/consumer.ts", statement + "\n")
+				self.assertTrue(skillnull_gate.find_references(self.repo_root, entry, entry.read_text()))
+
 	def invoke_hook(self, event: str, **extra: object) -> dict:
 		payload = {
 			"hook_event_name": event, "session_id": "dynamic-session",
